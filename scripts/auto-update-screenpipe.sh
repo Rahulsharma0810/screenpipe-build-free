@@ -224,8 +224,56 @@ build_once() {
     if trigger_and_wait "$tag"; then
         download_artifact "$tag"
         echo "$tag" > "$STATE_FILE"
-        ok "DONE: $tag built. Drag the .app from $OUT_DIR/$tag/ to /Applications."
-        ok "First launch: right-click -> Open (Gatekeeper bypass for ad-hoc-signed app)."
+        
+        # Automatic local installation/updating logic
+        local dest="$OUT_DIR/$tag"
+        local dmg_file
+        dmg_file="$(find "$dest" -name "*.dmg" | head -n1 || true)"
+        if [ -n "$dmg_file" ]; then
+            log "Found DMG: $dmg_file. Mounting..."
+            local mount_point
+            mount_point="$(hdiutil mount "$dmg_file" | grep -E "/Volumes/" | awk -F'\t' '{print $NF}' || true)"
+            if [ -n "$mount_point" ]; then
+                log "Mounted at: $mount_point"
+                log "Stopping any running Screenpipe instances..."
+                killall screenpipe-app 2>/dev/null || true
+                killall screenpipe 2>/dev/null || true
+                
+                log "Copying screenpipe.app to /Applications..."
+                rm -rf "/Applications/screenpipe.app"
+                cp -R "$mount_point/screenpipe.app" "/Applications/"
+                
+                log "Unmounting DMG..."
+                hdiutil unmount "$mount_point"
+                
+                log "Bypassing Gatekeeper / quarantine..."
+                xattr -cr "/Applications/screenpipe.app"
+                
+                ok "Successfully updated /Applications/screenpipe.app to $tag!"
+                log "Launching Screenpipe..."
+                open -a "/Applications/screenpipe.app"
+            else
+                warn "Failed to mount DMG automatically."
+            fi
+        else
+            # Try fallback zip if DMG not found
+            local zip_file
+            zip_file="$(find "$dest" -name "*.zip" | head -n1 || true)"
+            if [ -n "$zip_file" ]; then
+                log "Found ZIP: $zip_file. Extracting..."
+                killall screenpipe-app 2>/dev/null || true
+                killall screenpipe 2>/dev/null || true
+                rm -rf "/Applications/screenpipe.app"
+                unzip -q "$zip_file" -d "/Applications/"
+                xattr -cr "/Applications/screenpipe.app"
+                ok "Successfully updated /Applications/screenpipe.app to $tag from ZIP!"
+                open -a "/Applications/screenpipe.app"
+            else
+                warn "No DMG or ZIP found in artifacts. Skipping automatic installation."
+            fi
+        fi
+
+        ok "DONE: $tag built and installed!"
         return 0
     fi
     return 1

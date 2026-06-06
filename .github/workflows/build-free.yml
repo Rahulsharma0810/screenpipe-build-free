@@ -26,7 +26,7 @@ on:
         required: false
         default: "screenpipe/screenpipe"
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 */2 * * *" # Run every 2 hours to check for new releases
 
 concurrency:
   # group on the dispatched ref+upstream so manual reruns of the SAME tag
@@ -38,13 +38,57 @@ env:
   GIT_LFS_SKIP_SMUDGE: "1"
 
 jobs:
+  check-new-release:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: Check upstream release
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG=$(curl -s "https://api.github.com/repos/screenpipe/screenpipe/releases/latest" | jq -r '.tag_name')
+          if [ -z "$UPSTREAM_TAG" ] || [ "$UPSTREAM_TAG" = "null" ]; then
+            echo "Failed to fetch upstream release tag."
+            exit 1
+          fi
+          echo "Latest upstream release tag: $UPSTREAM_TAG"
+          
+          BUILD_TAG="${{ github.event.inputs.ref }}"
+          if [ -z "$BUILD_TAG" ]; then
+            BUILD_TAG="$UPSTREAM_TAG"
+            IS_SCHEDULED="true"
+          else
+            BUILD_TAG="$BUILD_TAG"
+            IS_SCHEDULED="false"
+          fi
+          echo "Target build tag: $BUILD_TAG"
+          echo "tag=$BUILD_TAG" >> "$GITHUB_OUTPUT"
+          
+          if gh release view "$BUILD_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if [ "$IS_SCHEDULED" = "true" ]; then
+              echo "Already up to date. Skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Manual trigger: forcing build."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "New release found: $BUILD_TAG"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-macos-arm64:
+    needs: check-new-release
+    if: needs.check-new-release.outputs.skip != 'true'
     # macos-latest on GitHub Actions is currently the Apple Silicon image
     # (M1). It is binary-compatible with M3 - same aarch64-apple-darwin slice.
     runs-on: macos-latest
     timeout-minutes: 120
     permissions:
-      contents: read
+      contents: write
 
     env:
       # Apple Silicon target. MLX Metal kernels and std::filesystem in
@@ -73,7 +117,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.inputs.upstream || 'screenpipe/screenpipe' }}
-          ref: ${{ github.event.inputs.ref || 'main' }}
+          ref: ${{ needs.check-new-release.outputs.tag }}
           fetch-depth: 1
           # we patch tauri.conf.json + need bun's pre_build.js, both ship in
           # the upstream tree. LFS blobs (mlx.metallib etc.) ARE needed for
@@ -401,6 +445,20 @@ jobs:
           path: ${{ runner.temp }}/stage/*
           if-no-files-found: error
           retention-days: 14
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-new-release.outputs.tag }}
+        run: |
+          set -euxo pipefail
+          STAGE="${{ runner.temp }}/stage"
+          # Create release or upload to existing one
+          gh release create "$TAG" \
+            --title "Screenpipe $TAG (Free)" \
+            --notes "Bypassed entitlement checks and pre-built with Metal/Apple Intelligence support." \
+            --clobber \
+            "$STAGE"/*
 
       - name: Dump tail of build log on failure
         if: failure()
