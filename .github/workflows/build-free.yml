@@ -81,6 +81,81 @@ jobs:
           # repo's .gitattributes references LFS, but only if lfs:true.
           lfs: true
 
+      - name: Patch entitlement gate (bypass subscription checks)
+        shell: bash
+        run: |
+          echo "Patching React frontend app-entitlement.ts..."
+          ENT_FILE="apps/screenpipe-app-tauri/lib/app-entitlement.ts"
+          node -e '
+            const fs = require("fs");
+            let content = fs.readFileSync(process.argv[1], "utf8");
+            const target = "export function isDevBillingBypassEnabled() {";
+            const idx = content.indexOf(target);
+            if (idx === -1) {
+              console.error("Target isDevBillingBypassEnabled not found!");
+              process.exit(1);
+            }
+            let braces = 0;
+            let start = idx + target.length;
+            let end = start;
+            let found = false;
+            for (let i = start; i < content.length; i++) {
+              if (content[i] === "{") braces++;
+              if (content[i] === "}") {
+                if (braces === 0) {
+                  end = i + 1;
+                  found = true;
+                  break;
+                }
+                braces--;
+              }
+            }
+            if (found) {
+              content = content.slice(0, idx) + "export function isDevBillingBypassEnabled() {\n  return true;\n}" + content.slice(end);
+              fs.writeFileSync(process.argv[1], content, "utf8");
+              console.log("React frontend patched successfully.");
+            } else {
+              console.error("Could not find end of isDevBillingBypassEnabled!");
+              process.exit(1);
+            }
+          ' "$ENT_FILE"
+
+          echo "Patching Rust backend store.rs..."
+          STORE_FILE="apps/screenpipe-app-tauri/src-tauri/src/store.rs"
+          node -e '
+            const fs = require("fs");
+            let content = fs.readFileSync(process.argv[1], "utf8");
+            const target = "pub fn app_entitled_or_dev(&self) -> bool {";
+            const idx = content.indexOf(target);
+            if (idx === -1) {
+              console.error("Target app_entitled_or_dev not found!");
+              process.exit(1);
+            }
+            let braces = 0;
+            let start = idx + target.length;
+            let end = start;
+            let found = false;
+            for (let i = start; i < content.length; i++) {
+              if (content[i] === "{") braces++;
+              if (content[i] === "}") {
+                if (braces === 0) {
+                  end = i + 1;
+                  found = true;
+                  break;
+                }
+                braces--;
+              }
+            }
+            if (found) {
+              content = content.slice(0, idx) + "pub fn app_entitled_or_dev(&self) -> bool {\n        true\n    }" + content.slice(end);
+              fs.writeFileSync(process.argv[1], content, "utf8");
+              console.log("Rust backend patched successfully.");
+            } else {
+              console.error("Could not find end of app_entitled_or_dev!");
+              process.exit(1);
+            }
+          ' "$STORE_FILE"
+
       - name: Detect Apple Intelligence (macOS 26 SDK)
         id: ai
         shell: bash
