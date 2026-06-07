@@ -453,10 +453,16 @@ jobs:
         run: |
           set -euxo pipefail
           STAGE="${{ runner.temp }}/stage"
-          # Create release or upload to existing one
-          gh release create "$TAG" \
-            --title "Screenpipe $TAG (Free)" \
-            --notes "Bypassed entitlement checks and pre-built with Metal/Apple Intelligence support." \
+          # Create release if it doesn't exist yet
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "Screenpipe $TAG (Free)" \
+              --notes "Bypassed entitlement checks and pre-built with Metal/Apple Intelligence support."
+          fi
+          # Upload files, overwriting existing ones of the same name
+          gh release upload "$TAG" \
+            --repo "${{ github.repository }}" \
             --clobber \
             "$STAGE"/*
 
