@@ -40,6 +40,7 @@ concurrency:
 
 env:
   GIT_LFS_SKIP_SMUDGE: "1"
+  CARGO_NET_RETRY: "3"
 
 jobs:
   check-new-release:
@@ -261,10 +262,13 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: build-free-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
-          # No shared-key / restore-keys — prevents stale binary cache hits when
-          # tauri.conf.json changes (the hash in the key covers Cargo.lock only;
-          # conf changes are caught by the TAURI_CONF_HASH env var below).
+          # shared-key stabilises the prefix so restore-keys below can match
+          # across different Cargo.lock hashes. Without restore-keys every tag
+          # change is a full cold rebuild (~2 h → ~30 min with warm deps).
+          shared-key: build-free-${{ env.TARGET }}
+          key: ${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            build-free-${{ env.TARGET }}-
           cache-directories: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
@@ -281,8 +285,18 @@ jobs:
             apps/screenpipe-app-tauri/src-tauri/ollama-*
             apps/screenpipe-app-tauri/src-tauri/lib/ollama
             apps/screenpipe-app-tauri/src-tauri/ui_monitor-*
-          key: build-free-bins-${{ env.TARGET }}-v1
+          key: build-free-bins-${{ env.TARGET }}-v2
           restore-keys: build-free-bins-${{ env.TARGET }}-
+
+      - name: Cache bun install (node_modules + global cache)
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/screenpipe-app-tauri/node_modules
+            ~/.bun/install/cache/
+          key: bun-deps-${{ hashFiles('apps/screenpipe-app-tauri/bun.lock') }}
+          restore-keys: |
+            bun-deps-
 
       - name: Install Homebrew dependencies
         shell: bash
