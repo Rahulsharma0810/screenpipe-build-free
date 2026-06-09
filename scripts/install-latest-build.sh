@@ -108,37 +108,55 @@ find_run_id() {
     esac
 }
 
-log "Finding build run..."
-RUN_ID="$(find_run_id "${SPECIFIC_RUN:-}")"
-[ -n "$RUN_ID" ] || die "no successful run found (spec=${SPECIFIC_RUN:-latest})"
+if [ -z "${SPECIFIC_RUN:-}" ]; then
+    log "Finding latest run with artifacts..."
+    # Query latest artifact across the repository (1 API call)
+    ARTIFACT_INFO="$(gh api "repos/$FORK_SLUG/actions/artifacts?per_page=1" --jq '.artifacts[0] // empty' 2>/dev/null || echo "")"
+    if [ -n "$ARTIFACT_INFO" ]; then
+        RUN_ID="$(echo "$ARTIFACT_INFO" | jq -r '.workflow_run.id // empty')"
+        ARTIFACT_NAME="$(echo "$ARTIFACT_INFO" | jq -r '.name // empty')"
+    else
+        die "no artifacts found in repository"
+    fi
+else
+    log "Finding build run..."
+    RUN_ID="$(find_run_id "${SPECIFIC_RUN:-}")"
+    [ -n "$RUN_ID" ] || die "no successful run found (spec=${SPECIFIC_RUN:-latest})"
+    
+    ARTIFACT_NAME="$(gh api "/repos/$FORK_SLUG/actions/runs/$RUN_ID/artifacts" \
+        --jq '.artifacts[0].name // empty' 2>/dev/null || echo "")"
+
+    if [ -z "$ARTIFACT_NAME" ]; then
+        warn "Run $RUN_ID has no artifacts (build may have skipped upload)."
+        warn "  Checking earlier successful runs for artifacts..."
+        # Skip runs with no artifacts by iterating until we find one
+        for older_run in $(gh run list --repo "$FORK_SLUG" --workflow "$WORKFLOW_FILE" \
+            --status success --limit 10 --json databaseId \
+            --jq '.[].databaseId' 2>/dev/null); do
+            [ "$older_run" = "$RUN_ID" ] && continue
+            ARTIFACT_NAME="$(gh api "/repos/$FORK_SLUG/actions/runs/$older_run/artifacts" \
+                --jq '.artifacts[0].name // empty' 2>/dev/null || echo "")"
+            if [ -n "$ARTIFACT_NAME" ]; then
+                RUN_ID="$older_run"
+                log "  → Using run $RUN_ID (artifact: $ARTIFACT_NAME)"
+                break
+            fi
+        done
+    fi
+fi
+
+[ -n "$RUN_ID" ] || die "could not find a run ID (spec=${SPECIFIC_RUN:-latest})"
+[ -n "$ARTIFACT_NAME" ] || die "no valid artifacts found for run $RUN_ID"
+
 ok "Run: $RUN_ID  https://github.com/$FORK_SLUG/actions/runs/$RUN_ID"
 
 # ---------- find & download artifact -----------------------------------------
-ARTIFACT_NAME="$(gh api "/repos/$FORK_SLUG/actions/runs/$RUN_ID/artifacts" \
-    --jq '.artifacts[0].name // empty' 2>/dev/null || echo "")"
-
-if [ -z "$ARTIFACT_NAME" ]; then
-    warn "Run $RUN_ID has no artifacts (build may have skipped upload)."
-    warn "  Checking earlier successful runs for artifacts..."
-    # Skip runs with no artifacts by iterating until we find one
-    for older_run in $(gh run list --repo "$FORK_SLUG" --workflow "$WORKFLOW_FILE" \
-        --status success --limit 10 --json databaseId \
-        --jq '.[].databaseId' 2>/dev/null); do
-        [ "$older_run" = "$RUN_ID" ] && continue
-        ARTIFACT_NAME="$(gh api "/repos/$FORK_SLUG/actions/runs/$older_run/artifacts" \
-            --jq '.artifacts[0].name // empty' 2>/dev/null || echo "")"
-        if [ -n "$ARTIFACT_NAME" ]; then
-            RUN_ID="$older_run"
-            log "  → Using run $RUN_ID (artifact: $ARTIFACT_NAME)"
-            break
-        fi
-    done
-fi
-
-[ -n "$ARTIFACT_NAME" ] || die "no artifacts found in any recent successful run"
+log "Artifact: $ARTIFACT_NAME"
 
 DEST="$OUT_DIR/run-$RUN_ID"
-if [ -d "$DEST" ]; then
+HAS_DMG="$(find "$DEST" -name "*.dmg" -maxdepth 2 2>/dev/null | head -n1 || true)"
+HAS_ZIP="$(find "$DEST" -name "*.zip" -maxdepth 2 2>/dev/null | head -n1 || true)"
+if [ -d "$DEST" ] && { [ -n "$HAS_DMG" ] || [ -n "$HAS_ZIP" ]; }; then
     log "Already downloaded to $DEST"
 else
     mkdir -p "$DEST"
