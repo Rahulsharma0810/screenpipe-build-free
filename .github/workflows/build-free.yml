@@ -262,11 +262,13 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          # key matches previous runs for cache hit; restore-keys provides
-          # partial reuse when Cargo.lock changes between tags.
+          # key matches previous runs for exact cache hit; restore-keys uses
+          # the full key prefix (including action-internal v0-rust- prefix)
+          # so `actions/cache` can do prefix-based matching when Cargo.lock
+          # changes between tags or PRs.
           key: build-free-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            build-free-${{ env.TARGET }}-
+            v0-rust-build-free-${{ env.TARGET }}-
           cache-directories: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
