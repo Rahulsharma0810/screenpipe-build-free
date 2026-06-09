@@ -227,6 +227,24 @@ jobs:
             }
           ' "$STORE_FILE"
 
+      - name: Patch ai-presets.tsx to include error details
+        shell: bash
+        run: |
+          echo "Patching React frontend ai-presets.tsx..."
+          NODE_FILE="apps/screenpipe-app-tauri/components/settings/ai-presets.tsx"
+          node -e '
+            const fs = require("fs");
+            let content = fs.readFileSync(process.argv[1], "utf8");
+            const target = "skipRemaining(\"endpoint\", `Connection failed: ${hint}`);";
+            if (!content.includes(target)) {
+              console.error("Target not found!");
+              process.exit(1);
+            }
+            content = content.replace(target, "console.error(\"diagnostics connection failed:\", err);\n        skipRemaining(\"endpoint\", `Connection failed: ${hint} (${err?.message || err}`);");
+            fs.writeFileSync(process.argv[1], content, "utf8");
+            console.log("ai-presets.tsx patched successfully.");
+          ' "$NODE_FILE"
+
       - name: Detect Apple Intelligence (macOS 26 SDK)
         id: ai
         shell: bash
