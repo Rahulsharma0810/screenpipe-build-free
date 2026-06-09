@@ -114,13 +114,36 @@ RUN_ID="$(find_run_id "${SPECIFIC_RUN:-}")"
 ok "Run: $RUN_ID  https://github.com/$FORK_SLUG/actions/runs/$RUN_ID"
 
 # ---------- find & download artifact -----------------------------------------
+ARTIFACT_NAME="$(gh api "/repos/$FORK_SLUG/actions/runs/$RUN_ID/artifacts" \
+    --jq '.artifacts[0].name // empty' 2>/dev/null || echo "")"
+
+if [ -z "$ARTIFACT_NAME" ]; then
+    warn "Run $RUN_ID has no artifacts (build may have skipped upload)."
+    warn "  Checking earlier successful runs for artifacts..."
+    # Skip runs with no artifacts by iterating until we find one
+    for older_run in $(gh run list --repo "$FORK_SLUG" --workflow "$WORKFLOW_FILE" \
+        --status success --limit 10 --json databaseId \
+        --jq '.[].databaseId' 2>/dev/null); do
+        [ "$older_run" = "$RUN_ID" ] && continue
+        ARTIFACT_NAME="$(gh api "/repos/$FORK_SLUG/actions/runs/$older_run/artifacts" \
+            --jq '.artifacts[0].name // empty' 2>/dev/null || echo "")"
+        if [ -n "$ARTIFACT_NAME" ]; then
+            RUN_ID="$older_run"
+            log "  → Using run $RUN_ID (artifact: $ARTIFACT_NAME)"
+            break
+        fi
+    done
+fi
+
+[ -n "$ARTIFACT_NAME" ] || die "no artifacts found in any recent successful run"
+
 DEST="$OUT_DIR/run-$RUN_ID"
 if [ -d "$DEST" ]; then
     log "Already downloaded to $DEST"
 else
     mkdir -p "$DEST"
-    log "Downloading artifacts to $DEST..."
-    gh run download "$RUN_ID" --repo "$FORK_SLUG" --dir "$DEST"
+    log "Downloading artifact '$ARTIFACT_NAME' to $DEST..."
+    gh run download "$RUN_ID" --repo "$FORK_SLUG" --name "$ARTIFACT_NAME" --dir "$DEST"
 fi
 
 DMG_FILE="$(find "$DEST" -name "*.dmg" -maxdepth 2 | head -n1 || true)"
