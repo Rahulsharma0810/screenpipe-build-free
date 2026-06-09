@@ -114,28 +114,24 @@ RUN_ID="$(find_run_id "${SPECIFIC_RUN:-}")"
 ok "Run: $RUN_ID  https://github.com/$FORK_SLUG/actions/runs/$RUN_ID"
 
 # ---------- find & download artifact -----------------------------------------
-ARTIFACT_NAME="$(gh run view "$RUN_ID" --repo "$FORK_SLUG" --json name \
-    --jq '.name' 2>/dev/null || echo "")"
-[ -n "$ARTIFACT_NAME" ] || die "could not get artifact name from run $RUN_ID"
-log "Artifact: $ARTIFACT_NAME"
-
 DEST="$OUT_DIR/run-$RUN_ID"
 if [ -d "$DEST" ]; then
     log "Already downloaded to $DEST"
 else
     mkdir -p "$DEST"
-    log "Downloading artifact to $DEST..."
-    gh run download "$RUN_ID" --repo "$FORK_SLUG" --name "$ARTIFACT_NAME" --dir "$DEST"
+    log "Downloading artifacts to $DEST..."
+    gh run download "$RUN_ID" --repo "$FORK_SLUG" --dir "$DEST"
 fi
 
-DMG_FILE="$(find "$DEST" -name "*.dmg" -maxdepth 1 | head -n1 || true)"
-ZIP_FILE="$(find "$DEST" -name "*.zip" -maxdepth 1 | head -n1 || true)"
+DMG_FILE="$(find "$DEST" -name "*.dmg" -maxdepth 2 | head -n1 || true)"
+ZIP_FILE="$(find "$DEST" -name "*.zip" -maxdepth 2 | head -n1 || true)"
 
 if [ -z "$DMG_FILE" ] && [ -z "$ZIP_FILE" ]; then
-    die "no .dmg or .zip found in artifact (contents: $(ls "$DEST"))"
+    die "no .dmg or .zip found in artifact (contents: $(ls -R "$DEST"))"
 fi
 
-ok "Artifact downloaded: ${DMG_FILE:-$ZIP_FILE}"
+ARTIFACT_FOUND="${DMG_FILE:-$ZIP_FILE}"
+ok "Artifact downloaded: $ARTIFACT_FOUND"
 [ "$CHECK_ONLY" -eq 1 ] && { ok "Check complete. Exiting."; exit 0; }
 
 # ---------- store artifact path for later reference --------------------------
@@ -240,94 +236,22 @@ xattr -cr "$APP_PATH" 2>/dev/null || true
 log "Verifying ad-hoc signature..."
 codesign -dv --deep --strict "$APP_PATH" 2>&1 | grep -E "adhoc|Signed Time|Sealed Resources" || true
 
-# ---------- permissions check & recovery -------------------------------------
+# ---------- permissions recovery ----------------------------------------------
 # Since ad-hoc signatures change per build, TCC may not recognize the new
-# binary.  We check each required permission and open System Settings if missing.
-recover_tcc() {
-    log "Checking TCC permissions after replacement..."
-
-    local tcc_db
-    tcc_db="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
-
-    local needs_recovery=0
-
-    # Check screen recording permission via CGPreflightScreenCaptureAccess
-    # (polling-safe; no prompt triggered)
-    if ! osascript -e '
-        tell application "System Events"
-            set screenCap to do shell script "
-                python3 -c \"
-import Quartz
-if Quartz.CGPreflightScreenCaptureAccess():
-    print(\"granted\")
-else:
-    print(\"denied\")
-\" 2>/dev/null || echo \"denied\"
-            "
-            return screenCap
-        end tell' 2>/dev/null | grep -q "granted"; then
-        warn "Screen Recording: missing"
-        needs_recovery=1
-    else
-        ok "Screen Recording: OK"
-    fi
-
-    # Check accessibility (safe polling, no prompt)
-    if ! osascript -e '
-        use framework "ApplicationServices"
-        set trusted to current application\'s AXIsProcessTrusted()
-        if trusted then
-            return "granted"
-        else
-            return "denied"
-        end if' 2>/dev/null | grep -q "granted"; then
-        warn "Accessibility: missing"
-        needs_recovery=1
-    else
-        ok "Accessibility: OK"
-    fi
-
-    # Check microphone (safe polling via AVAudioSession)
-    if [ -r "$tcc_db" ]; then
-        local mic_status
-        mic_status="$(sqlite3 "$tcc_db" \
-            "SELECT auth_value FROM access WHERE client LIKE '%$BUNDLE_ID%' AND service == 'kTCCServiceMicrophone';" \
-            2>/dev/null | head -1 || echo "0")"
-        if [ "$mic_status" = "2" ]; then
-            ok "Microphone: OK"
-        else
-            warn "Microphone: missing"
-            needs_recovery=1
-        fi
-    fi
-
-    if [ "$needs_recovery" -eq 1 ]; then
-        warn ""
-        warn "=============================================================="
-        warn " Some permissions may need to be re-granted for the new build."
-        warn " Opening System Settings to the required panes..."
-        warn " Grant the following permissions when prompted:"
-        warn "   1. Screen Recording"
-        warn "   2. Accessibility"
-        warn "   3. Microphone (if using audio)"
-        warn "=============================================================="
-        warn ""
-
-        # Open the relevant System Settings panes
-        sleep 0.5
-        open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
-        sleep 0.5
-        open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-        sleep 0.5
-        open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-
-        log "Settings opened. Grant permissions, then press any key to continue..."
-        read -r -n 1 -s < /dev/tty || true
-        echo >&2
-    fi
-}
-
-recover_tcc
+# binary.  We cannot reliably check *screenpipe's* permissions from a shell
+# script (osascript checks Terminal's grants, not another app's).  Instead we
+# open System Settings to the relevant panes so the user can quickly toggle
+# them if needed.  The app's own onboarding will detect and request any
+# missing permissions on first launch.
+log "Opening System Settings for permission review (new build = may need re-grant)..."
+sleep 0.3
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+sleep 0.3
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+sleep 0.3
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+log "  → System Settings opened.  Verify Screen Recording, Accessibility,"
+log "    and Microphone are toggled ON for screenpipe in each pane."
 
 # ---------- launch -----------------------------------------------------------
 log "Launching screenpipe..."
