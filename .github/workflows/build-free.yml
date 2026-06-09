@@ -227,7 +227,7 @@ jobs:
             }
           ' "$STORE_FILE"
 
-      - name: Patch ai-presets.tsx to include error details
+      - name: Patch ai-presets.tsx to include error details and bypass CORS for local IPs
         shell: bash
         run: |
           echo "Patching React frontend ai-presets.tsx..."
@@ -235,15 +235,38 @@ jobs:
           node -e '
             const fs = require("fs");
             let content = fs.readFileSync(process.argv[1], "utf8");
+            
+            // 1. Appends diagnostics connection error messages in parentheses
             const target = "skipRemaining(\"endpoint\", `Connection failed: ${hint}`);";
             if (!content.includes(target)) {
-              console.error("Target not found!");
+              console.error("Target toast not found!");
               process.exit(1);
             }
-            content = content.replace(target, "console.error(\"diagnostics connection failed:\", err);\n        skipRemaining(\"endpoint\", `Connection failed: ${hint} (${err?.message || err}`);");
+            content = content.replace(target, "console.error(\"diagnostics connection failed:\", err);\n        skipRemaining(\"endpoint\", `Connection failed: ${hint} (${err?.message || err})`);");
+            
+            // 2. Patch isLocalhostUrl to support private IPs
+            const oldLocalhostCheck = "return hostname === \"localhost\" || hostname === \"127.0.0.1\" || hostname === \"::1\";";
+            if (content.includes(oldLocalhostCheck)) {
+              content = content.replace(oldLocalhostCheck, "if (hostname === \"localhost\" || hostname === \"127.0.0.1\" || hostname === \"::1\") return true;\n    if (/^10\\./.test(hostname)) return true;\n    if (/^172\\.(1[6-9]|2[0-9]|3[01])\\./.test(hostname)) return true;\n    if (/^192\\.168\\./.test(hostname)) return true;\n    return false;");
+              console.log("isLocalhostUrl patched successfully.");
+            } else {
+              console.log("isLocalhostUrl already patched or not found.");
+            }
+            
+            // 3. Patch fetchFn in Step 4 to bypass CORS for localhost and local network URLs
+            const oldFetchFn = "const fetchFn = (isChatGpt || isAnthropic) ? tauriFetch : fetch;";
+            if (content.includes(oldFetchFn)) {
+              content = content.replace(oldFetchFn, "const fetchFn = (isChatGpt || isAnthropic || isLocalhostUrl(chatUrl)) ? tauriFetch : fetch;");
+              console.log("fetchFn patched successfully.");
+            } else {
+              console.error("Target fetchFn not found!");
+              process.exit(1);
+            }
+            
             fs.writeFileSync(process.argv[1], content, "utf8");
-            console.log("ai-presets.tsx patched successfully.");
+            console.log("ai-presets.tsx patch sequence complete.");
           ' "$NODE_FILE"
+
 
       - name: Detect Apple Intelligence (macOS 26 SDK)
         id: ai
