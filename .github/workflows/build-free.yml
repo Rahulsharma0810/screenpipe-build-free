@@ -262,11 +262,9 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          # shared-key stabilises the prefix so restore-keys below can match
-          # across different Cargo.lock hashes. Without restore-keys every tag
-          # change is a full cold rebuild (~2 h → ~30 min with warm deps).
-          shared-key: build-free-${{ env.TARGET }}
-          key: ${{ hashFiles('**/Cargo.lock') }}
+          # key matches previous runs for cache hit; restore-keys provides
+          # partial reuse when Cargo.lock changes between tags.
+          key: build-free-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             build-free-${{ env.TARGET }}-
           cache-directories: |
