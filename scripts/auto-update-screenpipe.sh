@@ -10,10 +10,11 @@
 #   Auth:         `gh auth login` once. Token needs repo + workflow scopes.
 #
 #   Usage:
-#       scripts/auto-update-screenpipe.sh                 # check + build newest
-#       scripts/auto-update-screenpipe.sh --force         # rebuild even if up to date
-#       scripts/auto-update-screenpipe.sh --tag v2.4.212  # build a specific tag
-#       scripts/auto-update-screenpipe.sh --watch         # loop forever (12h cadence)
+#       scripts/auto-update-screenpipe.sh                                  # check + build newest
+#       scripts/auto-update-screenpipe.sh --force                          # rebuild even if up to date
+#       scripts/auto-update-screenpipe.sh --tag v2.4.212                   # build a specific tag
+#       scripts/auto-update-screenpipe.sh --pr 3929                        # build from a PR merge commit
+#       scripts/auto-update-screenpipe.sh --watch                          # loop forever (12h cadence)
 #
 # Conventions assumed about your fork:
 #   * remote `origin`        -> upstream  screenpipe/screenpipe (read only)
@@ -46,11 +47,13 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 # -------- args ---------------------------------------------------------------
 FORCE=0
 EXPLICIT_TAG=""
+PR_NUM=""
 WATCH=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --force)        FORCE=1 ;;
         --tag)          EXPLICIT_TAG="${2:?missing tag}"; shift ;;
+        --pr)           PR_NUM="${2:?missing PR number}"; shift ;;
         --watch)        WATCH=1 ;;
         -h|--help)      sed -n '2,30p' "$0"; exit 0 ;;
         *)              die "unknown arg: $1" ;;
@@ -81,7 +84,10 @@ log "Fork repo for Actions: $FORK_SLUG"
 log "Fetching upstream tags from $UPSTREAM_REMOTE..."
 git fetch --quiet --tags "$UPSTREAM_REMOTE"
 
-if [ -n "$EXPLICIT_TAG" ]; then
+if [ -n "$PR_NUM" ]; then
+    TARGET_TAG="pr-$PR_NUM"
+    log "Building PR #$PR_NUM (tag=$TARGET_TAG)"
+elif [ -n "$EXPLICIT_TAG" ]; then
     TARGET_TAG="$EXPLICIT_TAG"
 else
     # newest semver-ish tag by creation date
@@ -94,9 +100,12 @@ log "Target tag: $TARGET_TAG"
 CURRENT_TAG=""
 [ -f "$STATE_FILE" ] && CURRENT_TAG="$(cat "$STATE_FILE")"
 
-if [ "$FORCE" -eq 0 ] && [ "$TARGET_TAG" = "$CURRENT_TAG" ]; then
-    ok "Already built $TARGET_TAG (use --force to rebuild)"
-    [ "$WATCH" -eq 1 ] || exit 0
+# PR builds always run (no skip)
+if [ -z "$PR_NUM" ]; then
+    if [ "$FORCE" -eq 0 ] && [ "$TARGET_TAG" = "$CURRENT_TAG" ]; then
+        ok "Already built $TARGET_TAG (use --force to rebuild)"
+        [ "$WATCH" -eq 1 ] || exit 0
+    fi
 fi
 
 # -------- push only the workflow file to the fork (orphan branch) -----------
@@ -136,7 +145,7 @@ EOF
 # -------- trigger workflow + wait + on-failure debug ------------------------
 trigger_and_wait() {
     local tag="$1"
-    local run_id pre_max post_max status conclusion fail_step
+    local run_id pre_max post_max status conclusion fail_step api_args
 
     pre_max="$(gh run list --repo "$FORK_SLUG" --workflow "$WORKFLOW_FILE" \
         --limit 1 --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null || echo 0)"
@@ -149,12 +158,18 @@ trigger_and_wait() {
     # default-branch lookup quirk on brand-new repos.
     local dispatch_ok=0
     for attempt in $(seq 1 20); do
-        if gh api -X POST \
-            "/repos/$FORK_SLUG/actions/workflows/$WORKFLOW_FILE/dispatches" \
-            -f "ref=$BUILD_BRANCH" \
-            -f "inputs[ref]=$tag" \
-            -f "inputs[upstream]=screenpipe/screenpipe" \
-            >/dev/null 2>&1; then
+        api_args=(
+            -X POST
+            "/repos/$FORK_SLUG/actions/workflows/$WORKFLOW_FILE/dispatches"
+            -f "ref=$BUILD_BRANCH"
+        )
+        if [ -n "$PR_NUM" ]; then
+            api_args+=(-f "inputs[pr]=$PR_NUM")
+        else
+            api_args+=(-f "inputs[ref]=$tag")
+        fi
+        api_args+=(-f "inputs[upstream]=screenpipe/screenpipe")
+        if gh api "${api_args[@]}" >/dev/null 2>&1; then
             dispatch_ok=1
             ok "Dispatched (attempt $attempt)"
             break

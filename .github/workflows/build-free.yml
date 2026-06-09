@@ -21,6 +21,10 @@ on:
         description: "Upstream screenpipe/screenpipe git ref (tag/branch/SHA) to build"
         required: false
         default: ""
+      pr:
+        description: "Upstream PR number to build (e.g. 3929 — overrides ref)"
+        required: false
+        default: ""
       upstream:
         description: "Upstream repo (owner/name)"
         required: false
@@ -29,9 +33,9 @@ on:
     - cron: "0 */2 * * *" # Run every 2 hours to check for new releases
 
 concurrency:
-  # group on the dispatched ref+upstream so manual reruns of the SAME tag
-  # cancel the older one, but two different tags can build in parallel.
-  group: build-free-${{ github.event.inputs.ref || 'main' }}-${{ github.event.inputs.upstream || 'screenpipe/screenpipe' }}
+  # group on the dispatched ref+upstream+pr so manual reruns of the SAME tag
+  # cancel the older one, but different tags/prs can build in parallel.
+  group: build-free-${{ github.event.inputs.ref || github.event.inputs.pr || 'main' }}-${{ github.event.inputs.upstream || 'screenpipe/screenpipe' }}
   cancel-in-progress: true
 
 env:
@@ -49,6 +53,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          PR_NUM="${{ github.event.inputs.pr }}"
+          if [ -n "$PR_NUM" ]; then
+            echo "Building from PR #$PR_NUM"
+            echo "tag=pr-$PR_NUM" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           UPSTREAM_TAG=$(curl -s "https://api.github.com/repos/screenpipe/screenpipe/releases/latest" | jq -r '.tag_name')
           if [ -z "$UPSTREAM_TAG" ] || [ "$UPSTREAM_TAG" = "null" ]; then
             echo "Failed to fetch upstream release tag."
@@ -113,11 +125,25 @@ jobs:
       CI: "false"
 
     steps:
+      - name: Resolve checkout ref
+        id: resolve-ref
+        shell: bash
+        run: |
+          PR_NUM="${{ github.event.inputs.pr }}"
+          if [ -n "$PR_NUM" ]; then
+            CHECKOUT_REF="refs/pull/$PR_NUM/merge"
+            echo "Building from PR #$PR_NUM -> $CHECKOUT_REF"
+          else
+            CHECKOUT_REF="${{ needs.check-new-release.outputs.tag }}"
+            echo "Building from tag/ref -> $CHECKOUT_REF"
+          fi
+          echo "ref=$CHECKOUT_REF" >> "$GITHUB_OUTPUT"
+
       - name: Checkout upstream screenpipe source
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.inputs.upstream || 'screenpipe/screenpipe' }}
-          ref: ${{ needs.check-new-release.outputs.tag }}
+          ref: ${{ steps.resolve-ref.outputs.ref }}
           fetch-depth: 1
           # we patch tauri.conf.json + need bun's pre_build.js, both ship in
           # the upstream tree. LFS blobs (mlx.metallib etc.) ARE needed for
@@ -447,20 +473,19 @@ jobs:
           retention-days: 14
 
       - name: Create GitHub Release
+        if: ${{ !github.event.inputs.pr }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.check-new-release.outputs.tag }}
         run: |
           set -euxo pipefail
           STAGE="${{ runner.temp }}/stage"
-          # Create release if it doesn't exist yet
           if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --repo "${{ github.repository }}" \
               --title "Screenpipe $TAG (Free)" \
               --notes "Bypassed entitlement checks and pre-built with Metal/Apple Intelligence support."
           fi
-          # Upload files, overwriting existing ones of the same name
           gh release upload "$TAG" \
             --repo "${{ github.repository }}" \
             --clobber \
