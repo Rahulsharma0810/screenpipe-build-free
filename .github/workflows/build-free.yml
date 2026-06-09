@@ -465,18 +465,17 @@ jobs:
           /usr/bin/codesign --force --deep --sign - "$APP"
           /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP" || true
 
-      - name: Zip .app for upload (outside source dir)
+      - name: Copy DMG for upload (outside source dir)
         shell: bash
         run: |
           set -euo pipefail
           STAGE="$RUNNER_TEMP/stage"
           mkdir -p "$STAGE"
-          # ditto preserves resource forks / extended attrs / signatures.
-          ditto -c -k --sequesterRsrc --keepParent \
-            "${{ steps.out.outputs.app_path }}" \
-            "$STAGE/screenpipe-macos-arm64.zip"
           if [ -n "${{ steps.out.outputs.dmg_path }}" ]; then
             cp "${{ steps.out.outputs.dmg_path }}" "$STAGE/screenpipe-macos-arm64.dmg"
+          else
+            echo "Error: No DMG path found" >&2
+            exit 1
           fi
           ls -lh "$STAGE"
 
