@@ -267,6 +267,53 @@ jobs:
             console.log("ai-presets.tsx patch sequence complete.");
           ' "$NODE_FILE"
 
+      - name: Patch Pro/cloud gate (unlock connections + cloud entitlement)
+        # isDevBillingBypassEnabled (patched above) only short-circuits the
+        # *app* entitlement. The connections UI and cloud-gated features gate
+        # on `isPro = !!settings.user?.cloud_subscribed` / hasCloudEntitlement,
+        # which that patch does NOT touch — so integrations still render a
+        # "pro required" lock. Force those to true as well.
+        shell: bash
+        run: |
+          echo "Patching cloud entitlement in app-entitlement.ts..."
+          ENT="apps/screenpipe-app-tauri/lib/app-entitlement.ts"
+          node -e '
+            const fs = require("fs");
+            const f = process.argv[1];
+            let c = fs.readFileSync(f, "utf8");
+            const subs = [
+              ["export function hasLegacyPaidAccess(user: AppUser | null | undefined) {\n  return user?.cloud_subscribed === true;\n}",
+               "export function hasLegacyPaidAccess(user: AppUser | null | undefined) {\n  return true;\n}"],
+              ["export function hasCloudEntitlement(user: AppUser | null | undefined) {\n  return user?.cloud_subscribed === true || hasEntitlementFeature(user, \"cloud\");\n}",
+               "export function hasCloudEntitlement(user: AppUser | null | undefined) {\n  return true;\n}"],
+            ];
+            for (const [from, to] of subs) {
+              if (c.includes(from)) { c = c.replace(from, to); console.log("  patched:", to.split("(")[0]); }
+              else { console.log("  SKIP (target not found, upstream may have changed):", from.split("(")[0]); }
+            }
+            fs.writeFileSync(f, c, "utf8");
+          ' "$ENT"
+
+          echo "Patching connection isPro gate..."
+          patch_ispro() {
+            local file="$1"
+            node -e '
+              const fs = require("fs");
+              const f = process.argv[1];
+              let c = fs.readFileSync(f, "utf8");
+              const from = "const isPro = !!settings.user?.cloud_subscribed;";
+              if (!c.includes(from)) {
+                console.error("  Target isPro not found in " + f + " — upstream UI changed, failing so we notice.");
+                process.exit(1);
+              }
+              c = c.split(from).join("const isPro = true;");
+              fs.writeFileSync(f, c, "utf8");
+              console.log("  patched isPro in " + f);
+            ' "$file"
+          }
+          patch_ispro "apps/screenpipe-app-tauri/components/settings/connections-section.tsx"
+          patch_ispro "apps/screenpipe-app-tauri/components/post-install-connections-modal.tsx"
+          echo "Pro/cloud gate patch complete."
 
       - name: Detect Apple Intelligence (macOS 26 SDK)
         id: ai
