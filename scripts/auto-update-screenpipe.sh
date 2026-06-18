@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# screenpipe — pull newest upstream release, push to your fork, trigger the
+# `Build Free Screenpipe` workflow, wait for it, and on failure dump the
+# failed step's log so you (or your IDE / agent) can fix and rerun.
+#
+# Result on success: a downloaded zip/dmg in ./out/<tag>/ that you can
+# install on your M3 Mac (right-click -> Open the first time).
+#
+#   Requirements: git, gh (>=2.40), jq, curl
+#   Auth:         `gh auth login` once. Token needs repo + workflow scopes.
+#
+#   Usage:
+#       scripts/auto-update-screenpipe.sh                                  # check + build newest
+#       scripts/auto-update-screenpipe.sh --force                          # rebuild even if up to date
+#       scripts/auto-update-screenpipe.sh --tag v2.4.212                   # build a specific tag
+#       scripts/auto-update-screenpipe.sh --pr 3929                        # build from a PR merge commit
+#       scripts/auto-update-screenpipe.sh --tag app-v2.5.47 --apply-pr 4211 # build tag and apply PR 4211 patch
+#       scripts/auto-update-screenpipe.sh --watch                          # loop forever (12h cadence)
+#
+# Conventions assumed about your fork:
+#   * remote `origin`        -> upstream  screenpipe/screenpipe (read only)
+#   * remote `build-remote`  -> your fork (push target, runs Actions)
+#   Adjust UPSTREAM_REMOTE / FORK_REMOTE below if yours differ.
+
+set -Eeuo pipefail
+
+# -------- config -------------------------------------------------------------
+UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-origin}"
+FORK_REMOTE="${FORK_REMOTE:-build-remote}"
+WORKFLOW_FILE="${WORKFLOW_FILE:-build-free.yml}"
+BUILD_BRANCH="${BUILD_BRANCH:-build-free/auto}"   # branch we push tags to on the fork
+POLL_SECS="${POLL_SECS:-20}"
+WATCH_INTERVAL_SECS="${WATCH_INTERVAL_SECS:-43200}" # 12h
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE_DIR="${STATE_DIR:-$ROOT_DIR/.cache/screenpipe-auto}"
+OUT_DIR="${OUT_DIR:-$ROOT_DIR/out}"
+mkdir -p "$STATE_DIR" "$OUT_DIR"
+STATE_FILE="$STATE_DIR/last_built_tag"
+LOG_DIR="$STATE_DIR/logs"
+mkdir -p "$LOG_DIR"
+
+# -------- pretty -------------------------------------------------------------
+log()  { printf '\033[1;34m[*]\033[0m %s\n' "$*" >&2; }
+ok()   { printf '\033[1;32m[+]\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# -------- args ---------------------------------------------------------------
+FORCE=0
+EXPLICIT_TAG=""
+PR_NUM=""
+APPLY_PR_NUM=""
+WATCH=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force)        FORCE=1 ;;
+        --tag)          EXPLICIT_TAG="${2:?missing tag}"; shift ;;
+        --pr)           PR_NUM="${2:?missing PR number}"; shift ;;
+        --apply-pr)     APPLY_PR_NUM="${2:?missing PR number}"; shift ;;
+        --watch)        WATCH=1 ;;
+        -h|--help)      sed -n '2,30p' "$0"; exit 0 ;;
+        *)              die "unknown arg: $1" ;;
+    esac
+    shift
+done
+
+# -------- preflight ----------------------------------------------------------
+for bin in git gh jq curl; do
+    command -v "$bin" >/dev/null || die "missing required tool: $bin"
+done
+gh auth status >/dev/null 2>&1 || die "run 'gh auth login' first"
+
+cd "$ROOT_DIR"
+git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1 \
+    || die "no remote '$UPSTREAM_REMOTE' (set UPSTREAM_REMOTE=...)"
+git remote get-url "$FORK_REMOTE" >/dev/null 2>&1 \
+    || die "no remote '$FORK_REMOTE' (set FORK_REMOTE=...)"
+
+FORK_URL="$(git remote get-url "$FORK_REMOTE")"
+# extract owner/repo from any git URL form
+FORK_SLUG="$(echo "$FORK_URL" \
+    | sed -E 's#(git@|https?://)[^/:]+[/:]##; s#\.git$##')"
+[ -n "$FORK_SLUG" ] || die "could not parse fork slug from $FORK_URL"
+log "Fork repo for Actions: $FORK_SLUG"
+
+# -------- find target tag ----------------------------------------------------
+log "Fetching upstream tags from $UPSTREAM_REMOTE..."
+git fetch --quiet --tags --force "$UPSTREAM_REMOTE"
+
+if [ -n "$PR_NUM" ]; then
+    TARGET_TAG="pr-$PR_NUM"
+    log "Building PR #$PR_NUM (tag=$TARGET_TAG)"
+elif [ -n "$EXPLICIT_TAG" ]; then
+    TARGET_TAG="$EXPLICIT_TAG"
+else
+    # newest semver-ish tag by creation date
+    TARGET_TAG="$(git for-each-ref --sort=-creatordate --format '%(refname:short)' \
+        'refs/tags/v*' 'refs/tags/app-v*' | head -n1)"
+fi
+[ -n "$TARGET_TAG" ] || die "no tag found"
+
+if [ "$TARGET_TAG" = "main" ] || [ "$TARGET_TAG" = "master" ]; then
+    log "Resolving latest commit SHA for upstream branch $TARGET_TAG..."
+    SHA=$(curl -s "https://api.github.com/repos/screenpipe/screenpipe/commits/${TARGET_TAG}" | jq -r '.sha')
+    if [ -n "$SHA" ] && [ "$SHA" != "null" ]; then
+        SHORT_SHA="${SHA:0:7}"
+        TARGET_TAG="${TARGET_TAG}-${SHORT_SHA}"
+    fi
+fi
+
+if [ -n "$APPLY_PR_NUM" ]; then
+    # Replace commas with dashes for a safe tag name
+    SAFE_PR_SUFFIX=$(echo "$APPLY_PR_NUM" | tr ',' '-')
+    TARGET_TAG="${TARGET_TAG}-pr-${SAFE_PR_SUFFIX}"
+    log "Applying PRs #$APPLY_PR_NUM on top of tag: Target output tag is $TARGET_TAG"
+fi
+log "Target tag: $TARGET_TAG"
+
+CURRENT_TAG=""
+[ -f "$STATE_FILE" ] && CURRENT_TAG="$(cat "$STATE_FILE")"
+
+# PR builds always run (no skip)
+if [ -z "$PR_NUM" ]; then
+    if [ "$FORCE" -eq 0 ] && [ "$TARGET_TAG" = "$CURRENT_TAG" ]; then
+        ok "Already built $TARGET_TAG (use --force to rebuild)"
+        [ "$WATCH" -eq 1 ] || exit 0
+    fi
+fi
+
+# -------- push only the workflow file to the fork (orphan branch) -----------
+# We do NOT push the upstream source - that triggers Git LFS uploads of
+# hundreds of MB and routinely fails on missing local objects. Instead we
+# create an orphan branch on the fork containing only .github/workflows/,
+# and the workflow checks out screenpipe/screenpipe directly via
+# actions/checkout's `repository:` field. Result: ~5 KB push instead of ~1 GB.
+push_to_fork() {
+    log "Pushing workflow-only orphan branch '$BUILD_BRANCH' to $FORK_SLUG..."
+    local tmpdir="$STATE_DIR/orphan-$$"
+    rm -rf "$tmpdir"
+    mkdir -p "$tmpdir/.github/workflows" "$tmpdir/scripts"
+    cp "$ROOT_DIR/.github/workflows/$WORKFLOW_FILE" "$tmpdir/.github/workflows/"
+    cp "$ROOT_DIR/scripts/auto-update-screenpipe.sh" "$tmpdir/scripts/"
+    cat > "$tmpdir/README.md" <<EOF
+# screenpipe-build-free
+
+Auto-generated by \`scripts/auto-update-screenpipe.sh\`.
+Branch \`$BUILD_BRANCH\` carries only the workflow file - the build itself
+checks out upstream screenpipe/screenpipe directly.
+EOF
+    (
+        cd "$tmpdir"
+        git init --quiet --initial-branch="$BUILD_BRANCH"
+        git config user.name  "auto-update"
+        git config user.email "auto@local"
+        git add .
+        git commit --quiet -m "ci: build-free workflow"
+        git remote add fork "$(git -C "$ROOT_DIR" remote get-url "$FORK_REMOTE")"
+        git push --force fork "$BUILD_BRANCH:$BUILD_BRANCH"
+    )
+    rm -rf "$tmpdir"
+    ok "Workflow pushed to $FORK_SLUG:$BUILD_BRANCH"
+}
+
+# -------- trigger workflow + wait + on-failure debug ------------------------
+trigger_and_wait() {
+    local tag="$1"
+    local run_id pre_max post_max status conclusion fail_step api_args
+
+    pre_max="$(gh run list --repo "$FORK_SLUG" --workflow "$WORKFLOW_FILE" \
+        --limit 1 --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null || echo 0)"
+    pre_max="${pre_max:-0}"
+
+    log "Dispatching workflow $WORKFLOW_FILE on $FORK_SLUG (branch=$BUILD_BRANCH, upstream tag=$tag)..."
+    # New workflows need ~5-30s to be indexed by GitHub before `gh workflow run`
+    # can resolve them by filename. Retry until it accepts the dispatch (or
+    # we give up). Use the REST API directly to avoid `gh workflow run`'s
+    # default-branch lookup quirk on brand-new repos.
+    local dispatch_ok=0
+    for attempt in $(seq 1 20); do
+        api_args=(
+            -X POST
+            "/repos/$FORK_SLUG/actions/workflows/$WORKFLOW_FILE/dispatches"
+            -f "ref=$BUILD_BRANCH"
+        )
+        if [ -n "$PR_NUM" ]; then
+            api_args+=(-f "inputs[pr]=$PR_NUM")
+        else
+            local git_tag="${tag%-pr-*}"
+            # Strip commit SHA suffix if this is a branch run (e.g. main-20b6a54)
+            if [[ "$git_tag" =~ ^(main|master)-[0-9a-f]{7}$ ]]; then
+                git_tag="${git_tag%-*}"
+            fi
+            api_args+=(-f "inputs[ref]=$git_tag")
+        fi
+        if [ -n "$APPLY_PR_NUM" ]; then
+            api_args+=(-f "inputs[apply_pr]=$APPLY_PR_NUM")
+        fi
+        api_args+=(-f "inputs[upstream]=screenpipe/screenpipe")
+        if gh api "${api_args[@]}" >/dev/null 2>&1; then
+            dispatch_ok=1
+            ok "Dispatched (attempt $attempt)"
+            break
+        fi
+        log "  workflow not indexed yet (attempt $attempt/20), sleeping 5s..."
+        sleep 5
+    done
+    [ "$dispatch_ok" = "1" ] || die "could not dispatch after 20 attempts; check that $WORKFLOW_FILE is committed and Actions enabled on $FORK_SLUG"
+
+    log "Waiting for new run to appear..."
+    for _ in $(seq 1 30); do
+        post_max="$(gh run list --repo "$FORK_SLUG" --workflow "$WORKFLOW_FILE" \
+            --limit 1 --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null || echo 0)"
+        post_max="${post_max:-0}"
+        if [ "$post_max" -gt "$pre_max" ]; then
+            run_id="$post_max"; break
+        fi
+        sleep 2
+    done
+    [ -n "${run_id:-}" ] || die "workflow run never appeared"
+    ok "Run id: $run_id   https://github.com/$FORK_SLUG/actions/runs/$run_id"
+
+    # Stream-watch (gh handles backoff). Returns non-zero on failure.
+    if gh run watch "$run_id" --repo "$FORK_SLUG" --exit-status --interval "$POLL_SECS"; then
+        ok "Build succeeded"
+        return 0
+    fi
+
+    # ---- failure path: capture logs of the failed job/step ----------------
+    warn "Build failed - dumping failed step log to $LOG_DIR/$tag-$run_id.log"
+    gh run view "$run_id" --repo "$FORK_SLUG" --log-failed \
+        > "$LOG_DIR/$tag-$run_id.log" 2>&1 || true
+    fail_step="$(gh run view "$run_id" --repo "$FORK_SLUG" --json jobs \
+        --jq '.jobs[] | select(.conclusion=="failure") |
+              {job:.name, step:(.steps[] | select(.conclusion=="failure") | .name)}')"
+    warn "Failed steps:"
+    printf '%s\n' "$fail_step" >&2
+
+    # Tail of the log on stdout for IDE / agent to read.
+    echo "================= FAILED STEP LOG (tail) ================="
+    tail -n 200 "$LOG_DIR/$tag-$run_id.log" || true
+    echo "=========================================================="
+    echo "Full log: $LOG_DIR/$tag-$run_id.log"
+    echo "Run URL : https://github.com/$FORK_SLUG/actions/runs/$run_id"
+    return 1
+}
+
+download_artifact() {
+    local tag="$1" dest
+    dest="$OUT_DIR/$tag"
+    rm -rf "$dest" && mkdir -p "$dest"
+    log "Downloading artifacts to $dest..."
+    gh run download --repo "$FORK_SLUG" \
+        --name "$(gh run list --repo "$FORK_SLUG" --workflow "$WORKFLOW_FILE" \
+                  --limit 1 --json name,databaseId \
+                  --jq '.[0] | (.name)')" \
+        --dir "$dest" 2>/dev/null || \
+        gh run download --repo "$FORK_SLUG" --dir "$dest"
+    ok "Artifacts in $dest:"
+    ls -lh "$dest"
+}
+
+# -------- main one-shot ------------------------------------------------------
+build_once() {
+    local tag="$1"
+    push_to_fork
+    if trigger_and_wait "$tag"; then
+        download_artifact "$tag"
+        echo "$tag" > "$STATE_FILE"
+        
+        # Automatic local installation/updating logic
+        local dest="$OUT_DIR/$tag"
+        local dmg_file
+        dmg_file="$(find "$dest" -name "*.dmg" | head -n1 || true)"
+        if [ -n "$dmg_file" ]; then
+            log "Found DMG: $dmg_file. Mounting..."
+            local mount_point
+            mount_point="$(hdiutil mount "$dmg_file" | grep -E "/Volumes/" | awk -F'\t' '{print $NF}' || true)"
+            if [ -n "$mount_point" ]; then
+                log "Mounted at: $mount_point"
+                log "Stopping any running Screenpipe instances..."
+                killall screenpipe-app 2>/dev/null || true
+                killall screenpipe 2>/dev/null || true
+                
+                log "Copying screenpipe.app to /Applications..."
+                rm -rf "/Applications/screenpipe.app"
+                cp -R "$mount_point/screenpipe.app" "/Applications/"
+                
+                log "Unmounting DMG..."
+                hdiutil unmount "$mount_point"
+                
+                log "Bypassing Gatekeeper / quarantine..."
+                xattr -cr "/Applications/screenpipe.app"
+                
+                ok "Successfully updated /Applications/screenpipe.app to $tag!"
+                log "Launching Screenpipe..."
+                open -a "/Applications/screenpipe.app"
+            else
+                warn "Failed to mount DMG automatically."
+            fi
+        else
+            # Try fallback zip if DMG not found
+            local zip_file
+            zip_file="$(find "$dest" -name "*.zip" | head -n1 || true)"
+            if [ -n "$zip_file" ]; then
+                log "Found ZIP: $zip_file. Extracting..."
+                killall screenpipe-app 2>/dev/null || true
+                killall screenpipe 2>/dev/null || true
+                rm -rf "/Applications/screenpipe.app"
+                unzip -q "$zip_file" -d "/Applications/"
+                xattr -cr "/Applications/screenpipe.app"
+                ok "Successfully updated /Applications/screenpipe.app to $tag from ZIP!"
+                open -a "/Applications/screenpipe.app"
+            else
+                warn "No DMG or ZIP found in artifacts. Skipping automatic installation."
+            fi
+        fi
+
+        ok "DONE: $tag built and installed!"
+        return 0
+    fi
+    return 1
+}
+
+if [ "$WATCH" -eq 1 ]; then
+    while true; do
+        build_once "$TARGET_TAG" || warn "build failed, will retry next cycle"
+        log "Sleeping ${WATCH_INTERVAL_SECS}s before next upstream check..."
+        sleep "$WATCH_INTERVAL_SECS"
+        git fetch --quiet --tags --force "$UPSTREAM_REMOTE"
+        TARGET_TAG="$(git for-each-ref --sort=-creatordate \
+            --format '%(refname:short)' 'refs/tags/v*' 'refs/tags/app-v*' | head -n1)"
+    done
+else
+    build_once "$TARGET_TAG"
+fi
