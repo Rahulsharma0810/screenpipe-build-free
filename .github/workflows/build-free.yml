@@ -1,8 +1,8 @@
 name: Build Free Screenpipe (macOS arm64, unsigned)
 run-name: >-
-  ${{
-    (github.event.inputs.pr || github.event.client_payload.pr) && format('pr-{0}', github.event.inputs.pr || github.event.client_payload.pr) ||
-    (github.event.inputs.ref || github.event.client_payload.ref) && ((github.event.inputs.apply_pr || github.event.client_payload.apply_pr) && format('{0}-pr-{1}', github.event.inputs.ref || github.event.client_payload.ref, github.event.inputs.apply_pr || github.event.client_payload.apply_pr) || (github.event.inputs.ref || github.event.client_payload.ref)) ||
+  Build Free ${{
+    (github.event.inputs.pr || github.event.client_payload.pr) && format('PR #{0}', github.event.inputs.pr || github.event.client_payload.pr) ||
+    (github.event.inputs.ref || github.event.client_payload.ref) && ((github.event.inputs.apply_pr || github.event.client_payload.apply_pr) && format('{0} (PR #{1})', github.event.inputs.ref || github.event.client_payload.ref, github.event.inputs.apply_pr || github.event.client_payload.apply_pr) || (github.event.inputs.ref || github.event.client_payload.ref)) ||
     'latest'
   }}
 
