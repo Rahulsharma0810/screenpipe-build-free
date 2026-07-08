@@ -1,0 +1,910 @@
+name: Build Free Screenpipe (macOS arm64, unsigned)
+run-name: >-
+  Build Free ${{
+    (github.event.inputs.pr || github.event.client_payload.pr) && format('PR #{0}', github.event.inputs.pr || github.event.client_payload.pr) ||
+    (github.event.inputs.ref || github.event.client_payload.ref) && ((github.event.inputs.apply_pr || github.event.client_payload.apply_pr) && format('{0} (PR #{1})', github.event.inputs.ref || github.event.client_payload.ref, github.event.inputs.apply_pr || github.event.client_payload.apply_pr) || (github.event.inputs.ref || github.event.client_payload.ref)) ||
+    'latest'
+  }}
+
+# Builds an installable, ad-hoc-signed macOS Apple Silicon app from upstream
+# screenpipe/screenpipe.git, without any Apple Developer ID, notarization,
+# tauri updater key, or sentry secrets. Output: a .app you can drag to
+# /Applications after right-click -> Open (Gatekeeper one-time bypass).
+#
+# Triggers:
+#   * push to main             -> CI on every change you push
+#   * workflow_dispatch        -> manual run, optional ref input
+#   * schedule (daily 00:00)   -> picks up new upstream tags via the helper
+#
+# The companion script scripts/auto-update-screenpipe.sh polls upstream tags
+# and triggers this workflow against the newest tag, then waits for it to
+# finish and downloads the artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream screenpipe/screenpipe git ref (tag/branch/SHA) to build"
+        required: false
+        default: ""
+      pr:
+        description: "Upstream PR number to build (e.g. 3929 — overrides ref)"
+        required: false
+        default: ""
+      apply_pr:
+        description: "PR number to apply on top of the ref (optional, e.g. 4211)"
+        required: false
+        default: ""
+      upstream:
+        description: "Upstream repo (owner/name)"
+        required: false
+        default: "screenpipe/screenpipe"
+  repository_dispatch:
+    types: [upstream-release]
+
+concurrency:
+  # group on the dispatched ref+upstream+pr so manual reruns of the SAME tag
+  # cancel the older one, but different tags/prs can build in parallel.
+  group: build-free-${{ github.event.inputs.ref || github.event.client_payload.ref || github.event.inputs.pr || github.event.client_payload.pr || 'main' }}-${{ github.event.inputs.upstream || github.event.client_payload.upstream || 'screenpipe/screenpipe' }}
+  cancel-in-progress: true
+
+env:
+  GIT_LFS_SKIP_SMUDGE: "1"
+  CARGO_NET_RETRY: "3"
+
+jobs:
+  check-new-release:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      tag: ${{ steps.check.outputs.tag }}
+      base_ref: ${{ steps.check.outputs.base_ref }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+    steps:
+      - name: Check upstream release
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG=$(gh api repos/screenpipe/screenpipe/releases/latest --jq '.tag_name' 2>/dev/null || curl -s "https://api.github.com/repos/screenpipe/screenpipe/releases/latest" | jq -r '.tag_name // empty')
+          if [ -z "$UPSTREAM_TAG" ] || [ "$UPSTREAM_TAG" = "null" ]; then
+            echo "Failed to fetch upstream release tag."
+            exit 1
+          fi
+          echo "Latest upstream release tag: $UPSTREAM_TAG"
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+
+          PR_NUM="${{ github.event.inputs.pr || github.event.client_payload.pr }}"
+          if [ -n "$PR_NUM" ]; then
+            echo "Building from PR #$PR_NUM"
+            echo "tag=pr-$PR_NUM" >> "$GITHUB_OUTPUT"
+            echo "base_ref=pr-$PR_NUM" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          BUILD_TAG="${{ github.event.inputs.ref || github.event.client_payload.ref }}"
+          if [ -z "$BUILD_TAG" ]; then
+            BUILD_TAG="$UPSTREAM_TAG"
+            if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+              IS_SCHEDULED="false"
+            else
+              IS_SCHEDULED="true"
+            fi
+          else
+            BUILD_TAG="$BUILD_TAG"
+            IS_SCHEDULED="false"
+          fi
+          
+          # If BUILD_TAG is a branch like 'main' or 'master', resolve its latest commit SHA
+          # so we create a unique, timestamped/versioned release tag instead of overwriting a generic branch tag.
+          if [ "$BUILD_TAG" = "main" ] || [ "$BUILD_TAG" = "master" ]; then
+            SHA=$(gh api "repos/screenpipe/screenpipe/commits/${BUILD_TAG}" --jq '.sha' 2>/dev/null || curl -s "https://api.github.com/repos/screenpipe/screenpipe/commits/${BUILD_TAG}" | jq -r '.sha // empty')
+            if [ -n "$SHA" ] && [ "$SHA" != "null" ]; then
+              SHORT_SHA="${SHA:0:7}"
+              BUILD_TAG_RESOLVED="${BUILD_TAG}-${SHORT_SHA}"
+            else
+              BUILD_TAG_RESOLVED="$BUILD_TAG"
+            fi
+          else
+            BUILD_TAG_RESOLVED="$BUILD_TAG"
+          fi
+          
+          APPLY_PR="${{ github.event.inputs.apply_pr || github.event.client_payload.apply_pr }}"
+          if [ -n "$APPLY_PR" ]; then
+            SAFE_PR_SUFFIX=$(echo "$APPLY_PR" | tr ',' '-')
+            RELEASE_TAG="${BUILD_TAG_RESOLVED}-pr-${SAFE_PR_SUFFIX}"
+          else
+            RELEASE_TAG="$BUILD_TAG_RESOLVED"
+          fi
+          
+          echo "Target build tag: $BUILD_TAG"
+          echo "Release tag: $RELEASE_TAG"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BUILD_TAG" >> "$GITHUB_OUTPUT"
+          
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if [ "$IS_SCHEDULED" = "true" ]; then
+              echo "Already up to date. Skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Manual trigger: forcing build."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "New release found: $RELEASE_TAG"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-macos-arm64:
+    needs: check-new-release
+    if: needs.check-new-release.outputs.skip != 'true'
+    # macos-latest on GitHub Actions is currently the Apple Silicon image
+    # (M1). It is binary-compatible with M3 - same aarch64-apple-darwin slice.
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+
+    env:
+      # Apple Silicon target. MLX Metal kernels and std::filesystem in
+      # whisper.cpp/ggml require macOS 14 SDK.
+      TARGET: aarch64-apple-darwin
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      CMAKE_OSX_DEPLOYMENT_TARGET: "14.0"
+      # i8mm fix - whisper.cpp ggml miscompiles when __ARM_FEATURE_MATMUL_INT8
+      # is auto-defined on the GH runner. Force apple-m1 baseline so the
+      # output runs on every Apple Silicon Mac (M1/M2/M3/M4).
+      CFLAGS: "-mmacosx-version-min=14.0 -mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
+      CXXFLAGS: "-mmacosx-version-min=14.0 -mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
+      CMAKE_C_FLAGS: "-mmacosx-version-min=14.0"
+      CMAKE_CXX_FLAGS: "-mmacosx-version-min=14.0"
+      # Speed/size knobs - mirror what release-app.yml uses on macOS.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_INCREMENTAL: "false"
+      # CI=false so tauri's DMG bundler renders the background image (hdiutil
+      # otherwise skips the icon layout stage and you get a blank DMG).
+      CI: "false"
+
+    steps:
+      - name: Resolve checkout ref
+        id: resolve-ref
+        shell: bash
+        run: |
+          PR_NUM="${{ github.event.inputs.pr || github.event.client_payload.pr }}"
+          if [ -n "$PR_NUM" ]; then
+            CHECKOUT_REF="refs/pull/$PR_NUM/merge"
+            echo "Building from PR #$PR_NUM -> $CHECKOUT_REF"
+          else
+            CHECKOUT_REF="${{ needs.check-new-release.outputs.base_ref }}"
+            echo "Building from tag/ref -> $CHECKOUT_REF"
+          fi
+          echo "ref=$CHECKOUT_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream screenpipe source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.inputs.upstream || github.event.client_payload.upstream || 'screenpipe/screenpipe' }}
+          ref: ${{ steps.resolve-ref.outputs.ref }}
+          fetch-depth: 1
+          # we patch tauri.conf.json + need bun's pre_build.js, both ship in
+          # the upstream tree. LFS blobs (mlx.metallib etc.) ARE needed for
+          # the bundle - actions/checkout pulls them automatically when the
+          # repo's .gitattributes references LFS, but only if lfs:true.
+          lfs: true
+
+      - name: Apply PR patch
+        if: ${{ github.event.inputs.apply_pr != '' || github.event.client_payload.apply_pr != '' }}
+        shell: bash
+        run: |
+          # Split comma-separated PR numbers
+          APPLY_PR_VAL="${{ github.event.inputs.apply_pr || github.event.client_payload.apply_pr }}"
+          IFS=',' read -r -a PRs <<< "$APPLY_PR_VAL"
+          for PR_NUM in "${PRs[@]}"; do
+            PR_NUM=$(echo "$PR_NUM" | xargs) # trim whitespace
+            if [ -n "$PR_NUM" ]; then
+              echo "Applying patch for PR #$PR_NUM..."
+              UPSTREAM_REPO="${{ github.event.inputs.upstream || github.event.client_payload.upstream || 'screenpipe/screenpipe' }}"
+              curl -sSL "https://github.com/${UPSTREAM_REPO}/pull/${PR_NUM}.diff" > pr_${PR_NUM}.diff
+
+              # Tier 1: strict git apply (full context match)
+              if git apply --check pr_${PR_NUM}.diff 2>/dev/null && git apply pr_${PR_NUM}.diff; then
+                echo "Applied PR #$PR_NUM cleanly (strict)"
+              # Tier 2: reduced context (allows surrounding-line drift between PR base and release tag)
+              elif git apply --check -C1 pr_${PR_NUM}.diff 2>/dev/null && git apply -C1 pr_${PR_NUM}.diff; then
+                echo "::warning::Applied PR #$PR_NUM with reduced context (-C1). Verify the result."
+              # Tier 3: POSIX patch with fuzz (maximum flexibility for context drift)
+              elif git apply --check -C0 pr_${PR_NUM}.diff 2>/dev/null && git apply -C0 pr_${PR_NUM}.diff; then
+                echo "::warning::Applied PR #$PR_NUM with zero context (-C0). Verify the result."
+              else
+                echo "::error::Failed to apply patch for PR #$PR_NUM with all strategies. There might be real conflicts with the selected ref."
+                echo "--- Patch check diagnostics ---"
+                git apply --stat pr_${PR_NUM}.diff || true
+                git apply --check pr_${PR_NUM}.diff 2>&1 || true
+                exit 1
+              fi
+              rm pr_${PR_NUM}.diff
+              echo "Successfully applied patch for PR #$PR_NUM"
+            fi
+          done
+
+      - name: Add applied PR details (legacy step placeholder, logic moved after feature flags)
+        shell: bash
+        run: echo "Applied PRs logic relocated to print after target version is computed."
+
+      - name: Patch entitlement gate (bypass subscription checks)
+        shell: bash
+        run: |
+          echo "Patching React frontend app-entitlement.ts..."
+          ENT_FILE="apps/screenpipe-app-tauri/lib/app-entitlement.ts"
+          node -e '
+            const fs = require("fs");
+            let content = fs.readFileSync(process.argv[1], "utf8");
+            const target = "export function isDevBillingBypassEnabled() {";
+            const idx = content.indexOf(target);
+            if (idx === -1) {
+              console.error("Target isDevBillingBypassEnabled not found!");
+              process.exit(1);
+            }
+            let braces = 0;
+            let start = idx + target.length;
+            let end = start;
+            let found = false;
+            for (let i = start; i < content.length; i++) {
+              if (content[i] === "{") braces++;
+              if (content[i] === "}") {
+                if (braces === 0) {
+                  end = i + 1;
+                  found = true;
+                  break;
+                }
+                braces--;
+              }
+            }
+            if (found) {
+              content = content.slice(0, idx) + "export function isDevBillingBypassEnabled() {\n  return true;\n}" + content.slice(end);
+              fs.writeFileSync(process.argv[1], content, "utf8");
+              console.log("React frontend patched successfully.");
+            } else {
+              console.error("Could not find end of isDevBillingBypassEnabled!");
+              process.exit(1);
+            }
+          ' "$ENT_FILE"
+
+          echo "Patching Rust backend store.rs..."
+          STORE_FILE="apps/screenpipe-app-tauri/src-tauri/src/store.rs"
+          node -e '
+            const fs = require("fs");
+            let content = fs.readFileSync(process.argv[1], "utf8");
+            const target = "pub fn app_entitled_or_dev(&self) -> bool {";
+            const idx = content.indexOf(target);
+            if (idx === -1) {
+              console.error("Target app_entitled_or_dev not found!");
+              process.exit(1);
+            }
+            let braces = 0;
+            let start = idx + target.length;
+            let end = start;
+            let found = false;
+            for (let i = start; i < content.length; i++) {
+              if (content[i] === "{") braces++;
+              if (content[i] === "}") {
+                if (braces === 0) {
+                  end = i + 1;
+                  found = true;
+                  break;
+                }
+                braces--;
+              }
+            }
+            if (found) {
+              content = content.slice(0, idx) + "pub fn app_entitled_or_dev(&self) -> bool {\n        true\n    }" + content.slice(end);
+              fs.writeFileSync(process.argv[1], content, "utf8");
+              console.log("Rust backend patched successfully.");
+            } else {
+              console.error("Could not find end of app_entitled_or_dev!");
+              process.exit(1);
+            }
+          ' "$STORE_FILE"
+
+          echo "Patching Rust backend oauth.rs..."
+          OAUTH_FILE="apps/screenpipe-app-tauri/src-tauri/src/oauth.rs"
+          node -e '
+            const fs = require("fs");
+            const f = process.argv[1];
+            let c = fs.readFileSync(f, "utf8");
+            const idx = c.indexOf("let is_pro = SettingsStore::get(&app_handle)");
+            if (idx === -1) {
+              console.error("Target is_pro in oauth.rs not found!");
+              process.exit(1);
+            }
+            const endIdx = c.indexOf("== Some(true);", idx);
+            if (endIdx === -1) {
+              console.error("End of statement not found!");
+              process.exit(1);
+            }
+            c = c.slice(0, idx) + "let is_pro = true;" + c.slice(endIdx + "== Some(true);".length);
+            fs.writeFileSync(f, c, "utf8");
+            console.log("oauth.rs patched successfully.");
+          ' "$OAUTH_FILE"
+
+          echo "Patching general cloud_subscribed checks recursively in Rust backend..."
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+
+            function walk(dir) {
+              let results = [];
+              const list = fs.readdirSync(dir);
+              list.forEach(file => {
+                file = path.join(dir, file);
+                const stat = fs.statSync(file);
+                if (stat && stat.isDirectory()) {
+                  results = results.concat(walk(file));
+                } else if (file.endsWith(".rs")) {
+                  results.push(file);
+                }
+              });
+              return results;
+            }
+
+            const files = walk("apps/screenpipe-app-tauri/src-tauri/src");
+            let patchedCount = 0;
+            files.forEach(f => {
+              let content = fs.readFileSync(f, "utf8");
+              let changed = false;
+              
+              const patterns = [
+                ["settings.user.cloud_subscribed == Some(true)", "true"],
+                ["self.user.cloud_subscribed == Some(true)", "true"],
+              ];
+              
+              for (const [from, to] of patterns) {
+                if (content.includes(from)) {
+                  content = content.replaceAll(from, to);
+                  changed = true;
+                }
+              }
+              
+              if (changed) {
+                fs.writeFileSync(f, content, "utf8");
+                console.log("  patched cloud_subscribed in: " + f);
+                patchedCount++;
+              }
+            });
+            console.log("Total Rust files patched: " + patchedCount);
+          '
+
+
+
+      - name: Patch Tauri HTTP plugin scope to allow custom ports
+        # The upstream http:default scope uses "http://**/*" which does NOT
+        # match custom ports because URL Pattern treats an empty port as
+        # "default port only" (80 for http).  Changing to "http://*:*"
+        # allows any port, fixing "url not allowed on the configured scope"
+        # for custom AI providers on non-standard ports (e.g. :20128).
+        shell: bash
+        run: |
+          echo "Patching capabilities main.json..."
+          CAP="apps/screenpipe-app-tauri/src-tauri/capabilities/main.json"
+          node -e '
+            const fs = require("fs");
+            const f = process.argv[1];
+            let c = fs.readFileSync(f, "utf8");
+            // http://**/*  →  http://*:*
+            const from = "http://**/*";
+            const to   = "http://*:*";
+            if (c.includes(from)) {
+              c = c.replaceAll(from, to);
+              fs.writeFileSync(f, c, "utf8");
+              console.log("patched http://**/* -> http://*:*");
+            } else {
+              console.log("SKIP: http://**/* not found — upstream may have already fixed it");
+            }
+          ' "$CAP"
+
+      - name: Patch Pro/cloud gate (unlock connections + cloud entitlement)
+        # isDevBillingBypassEnabled (patched above) only short-circuits the
+        # *app* entitlement. The connections UI and cloud-gated features gate
+        # on `isPro = !!settings.user?.cloud_subscribed` / hasCloudEntitlement,
+        # which that patch does NOT touch — so integrations still render a
+        # "pro required" lock. Force those to true as well.
+        shell: bash
+        run: |
+          echo "Patching cloud entitlement in app-entitlement.ts..."
+          ENT="apps/screenpipe-app-tauri/lib/app-entitlement.ts"
+          node -e '
+            const fs = require("fs");
+            const f = process.argv[1];
+            let c = fs.readFileSync(f, "utf8");
+            const subs = [
+              ["export function hasLegacyPaidAccess(user: AppUser | null | undefined) {\n  return user?.cloud_subscribed === true;\n}",
+               "export function hasLegacyPaidAccess(user: AppUser | null | undefined) {\n  return true;\n}"],
+              ["export function hasCloudEntitlement(user: AppUser | null | undefined) {\n  return user?.cloud_subscribed === true || hasEntitlementFeature(user, \"cloud\");\n}",
+               "export function hasCloudEntitlement(user: AppUser | null | undefined) {\n  return true;\n}"],
+            ];
+            for (const [from, to] of subs) {
+              if (c.includes(from)) { c = c.replace(from, to); console.log("  patched:", to.split("(")[0]); }
+              else { console.log("  SKIP (target not found, upstream may have changed):", from.split("(")[0]); }
+            }
+            fs.writeFileSync(f, c, "utf8");
+          ' "$ENT"
+
+          echo "Patching connection isPro gate recursively..."
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+
+            function walk(dir) {
+              let results = [];
+              const list = fs.readdirSync(dir);
+              list.forEach(file => {
+                file = path.join(dir, file);
+                const stat = fs.statSync(file);
+                if (stat && stat.isDirectory()) {
+                  results = results.concat(walk(file));
+                } else if (file.endsWith(".ts") || file.endsWith(".tsx")) {
+                  results.push(file);
+                }
+              });
+              return results;
+            }
+
+            const files = walk("apps/screenpipe-app-tauri");
+            let patchedCount = 0;
+            files.forEach(f => {
+              let content = fs.readFileSync(f, "utf8");
+              let changed = false;
+              
+              const target1 = "const isPro = !!settings.user?.cloud_subscribed;";
+              if (content.includes(target1)) {
+                content = content.replaceAll(target1, "const isPro = true;");
+                changed = true;
+              }
+              
+              const target2 = "const isPro = settings.user?.cloud_subscribed === true;";
+              if (content.includes(target2)) {
+                content = content.replaceAll(target2, "const isPro = true;");
+                changed = true;
+              }
+
+              if (changed) {
+                fs.writeFileSync(f, content, "utf8");
+                console.log("  patched isPro in: " + f);
+                patchedCount++;
+              }
+            });
+            console.log("Total files patched: " + patchedCount);
+            if (patchedCount === 0) {
+              console.error("Error: No isPro gates were found or patched!");
+              process.exit(1);
+            }
+          '
+          echo "Pro/cloud gate patch complete."
+
+
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # shared-key is stable across Cargo.lock changes (PRs vs tags).
+          # The action auto-includes the Cargo.lock hash in the interior
+          # key, so different lockfiles still get unique full keys.
+          shared-key: build-free
+          key: ${{ env.TARGET }}
+          cache-directories: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            apps/screenpipe-app-tauri/src-tauri/target
+
+      - name: Cache Tauri sidecars / binary deps
+        uses: actions/cache@v5
+        with:
+          path: |
+            apps/screenpipe-app-tauri/src-tauri/ffmpeg
+            apps/screenpipe-app-tauri/src-tauri/ffmpeg-*
+            apps/screenpipe-app-tauri/src-tauri/tesseract-*
+            apps/screenpipe-app-tauri/src-tauri/ollama-*
+            apps/screenpipe-app-tauri/src-tauri/lib/ollama
+            apps/screenpipe-app-tauri/src-tauri/ui_monitor-*
+          key: build-free-bins-${{ env.TARGET }}-v2
+          restore-keys: build-free-bins-${{ env.TARGET }}-
+
+      - name: Cache bun install (node_modules + global cache)
+        uses: actions/cache@v5
+        with:
+          path: |
+            apps/screenpipe-app-tauri/node_modules
+            ~/.bun/install/cache/
+          key: bun-deps-${{ hashFiles('apps/screenpipe-app-tauri/bun.lock') }}
+          restore-keys: |
+            bun-deps-
+
+      - name: Install Homebrew dependencies
+        shell: bash
+        run: |
+          eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null || true)"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/sbin" >> "$GITHUB_PATH"
+          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
+          brew install ffmpeg wget pkg-config cmake
+
+      - name: Install frontend dependencies
+        working-directory: apps/screenpipe-app-tauri
+        run: bun install
+
+      - name: Patch next.config to skip type-checking
+        # v2.3.27 has a TypeScript error in gmail-card.tsx
+        # (oauthListInstances not in generated bindings for this tag).
+        # We skip TS type checking so Next.js builds successfully;
+        # the actual Rust backend is compiled with full type safety.
+        shell: bash
+        run: |
+          NCFG=apps/screenpipe-app-tauri/next.config.mjs
+          # Add typescript.ignoreBuildErrors + eslint.ignoreDuringBuilds
+          # if not already present
+          if ! grep -q 'ignoreBuildErrors' "$NCFG"; then
+            # Insert after the opening of the config object
+            sed -i '' 's/const nextConfig = {/const nextConfig = {\n  typescript: { ignoreBuildErrors: true },\n  eslint: { ignoreDuringBuilds: true },/' "$NCFG"
+            echo "Patched $NCFG to skip TS errors"
+          else
+            echo "Already patched"
+          fi
+          grep -A2 'typescript' "$NCFG" || true
+
+      - name: Run Tauri pre_build (downloads ffmpeg, ollama, ui_monitor sidecars)
+        working-directory: apps/screenpipe-app-tauri
+        run: bun ./scripts/pre_build.js
+
+      - name: Use production tauri config (productName=screenpipe, identifier=screenpi.pe)
+        # Without this we ship "screenpipe - Development.app" with the dev
+        # bundle id - causes update / multi-instance weirdness.
+        shell: bash
+        run: cp apps/screenpipe-app-tauri/src-tauri/tauri.prod.conf.json apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+
+      - name: Strip signing/updater config from tauri.conf.json
+        # We have no Developer ID, no Tauri updater key, no Sentry. Tauri will
+        # error out if signingIdentity is set but no cert is in the keychain,
+        # and `tauri build` refuses to run with `plugins.updater.pubkey` set
+        # but TAURI_SIGNING_PRIVATE_KEY missing. Patch the config to remove
+        # those blocks before building.
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONF=apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+          # jq is preinstalled on macos-latest runner images.
+          tmp=$(mktemp)
+          jq '
+            (.bundle.macOS.signingIdentity) = "-"           # ad-hoc signature
+            | del(.bundle.macOS.providerShortName)
+            | del(.bundle.macOS.entitlements)
+            | del(.bundle.macOS.certificate)                # no cert = no keychain import
+            | del(.bundle.macOS.certificatePassword)
+            | del(.bundle.macOS.notarize)                   # remove notarize block if present
+            | (.plugins.updater.active) = false              # disable updater — no signing key available
+            | (.plugins.updater.endpoints) = []            # no update endpoints
+            | del(.bundle.createUpdaterArtifacts)
+          ' "$CONF" > "$tmp"
+          mv "$tmp" "$CONF"
+          echo "--- patched bundle/macOS block ---"
+          jq '.bundle.macOS, .plugins.updater // "removed"' "$CONF"
+
+      - name: Force rebuild of screenpipe-app binary (bust stale tauri config cache)
+        # Tauri embeds tauri.conf.json into the binary at compile time via
+        # build.rs. The Rust cache stores the compiled binary, so patching
+        # the conf AFTER cache restore has no effect. We delete the cached
+        # screenpipe-app artefacts so cargo relinks with the patched config.
+        shell: bash
+        run: |
+          TARGET_DIR="apps/screenpipe-app-tauri/src-tauri/target/${{ env.TARGET }}/release"
+          echo "Removing stale screenpipe-app binaries to force recompile with patched config..."
+          rm -f  "$TARGET_DIR/screenpipe-app"
+          rm -f  "$TARGET_DIR/screenpipe-app.d"
+          rm -rf "$TARGET_DIR/build/screenpipe-app-"*
+          rm -rf "$TARGET_DIR/.fingerprint/screenpipe-app-"*
+          rm -rf "$TARGET_DIR/incremental/screenpipe-app-"*
+          echo "Done. Cargo will recompile screenpipe-app with fresh tauri.conf.json."
+
+      - name: Compute feature flags
+        id: feats
+        shell: bash
+        run: |
+          # Introspect available features from the actual checked-out Cargo.toml
+          # so this workflow works across any upstream tag regardless of which
+          # optional features have been added over time.
+          CARGO_TOML="apps/screenpipe-app-tauri/src-tauri/Cargo.toml"
+          has_feat() {
+            grep -qE "^${1}\s*=" "$CARGO_TOML"
+          }
+
+          FEATS="metal"
+          has_feat "parakeet-mlx"      && FEATS="${FEATS},parakeet-mlx"
+          has_feat "rfdetr-mlx"        && FEATS="${FEATS},rfdetr-mlx"
+          has_feat "parakeet"          && FEATS="${FEATS},parakeet" || true
+          has_feat "apple-intelligence" && FEATS="${FEATS},apple-intelligence" || true
+
+          echo "features=${FEATS}" >> "$GITHUB_OUTPUT"
+          echo "Building with features: ${FEATS}"
+
+          # Parse and output the exact app version from Cargo.toml
+          APP_VERSION=$(grep -m 1 '^version = ' "$CARGO_TOML" | cut -d '"' -f 2)
+          
+          # If we have an applied PR, suffix the version with the PR number so the artifact name stays distinct
+          APPLY_PR="${{ github.event.inputs.apply_pr || github.event.client_payload.apply_pr }}"
+          if [ -n "$APPLY_PR" ]; then
+            SAFE_PR_SUFFIX=$(echo "$APPLY_PR" | tr ',' '-')
+            APP_VERSION="${APP_VERSION}-pr-${SAFE_PR_SUFFIX}"
+          fi
+          echo "version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Determined artifact version: ${APP_VERSION}"
+
+      - name: Add PR and build details to Job Summary
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: ${{ github.event.inputs.upstream || github.event.client_payload.upstream || 'screenpipe/screenpipe' }}
+          UPSTREAM_TAG: ${{ needs.check-new-release.outputs.upstream_tag }}
+          BASE_REF: ${{ needs.check-new-release.outputs.base_ref }}
+          CHECKOUT_REF: ${{ steps.resolve-ref.outputs.ref }}
+        run: |
+          echo "## 🛠️ Build Summary & Pull Requests" >> $GITHUB_STEP_SUMMARY
+          echo "- **Base Ref**: \`$BASE_REF\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Version**: \`${{ steps.feats.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Latest Release Tag**: \`$UPSTREAM_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 1. Process Applied PRs via apply_pr
+          APPLY_PR_VAL="${{ github.event.inputs.apply_pr || github.event.client_payload.apply_pr }}"
+          if [ -n "$APPLY_PR_VAL" ]; then
+            echo "### 🔌 Dynamically Applied Patches (PRs)" >> $GITHUB_STEP_SUMMARY
+            echo "The following PR patches have been dynamically merged and built on top of the base ref:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            IFS=',' read -r -a PRs <<< "$APPLY_PR_VAL"
+            for PR_NUM in "${PRs[@]}"; do
+              PR_NUM=$(echo "$PR_NUM" | xargs)
+              if [ -n "$PR_NUM" ]; then
+                echo "Fetching details for applied PR #$PR_NUM..."
+                PR_JSON=$(gh pr view "$PR_NUM" --repo "$UPSTREAM_REPO" --json title,author,url,body 2>/dev/null || echo "{}")
+                if [ -n "$PR_JSON" ] && [ "$PR_JSON" != "{}" ]; then
+                  TITLE=$(echo "$PR_JSON" | jq -r '.title // "N/A"')
+                  AUTHOR=$(echo "$PR_JSON" | jq -r '.author.login // "N/A"')
+                  URL=$(echo "$PR_JSON" | jq -r '.url // "N/A"')
+                  echo "- **PR [#$PR_NUM]($URL)**: $TITLE (by @$AUTHOR)" >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "- **PR #$PR_NUM**: https://github.com/${UPSTREAM_REPO}/pull/${PR_NUM}" >> $GITHUB_STEP_SUMMARY
+                fi
+              fi
+            done
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # 2. Process Merged PRs since the last release tag
+          if [ -n "$UPSTREAM_TAG" ] && [ "$UPSTREAM_TAG" != "null" ]; then
+            COMPARE_REF="$CHECKOUT_REF"
+            echo "Comparing $UPSTREAM_TAG with $COMPARE_REF..."
+            
+            gh api "repos/${UPSTREAM_REPO}/compare/${UPSTREAM_TAG}...${COMPARE_REF}" 2>/dev/null | python3 -c '
+            import sys, json, re
+            try:
+                data = json.load(sys.stdin)
+                commits = data.get("commits", [])
+                if not commits:
+                    print("No new commits found.")
+                    sys.exit(0)
+                
+                pr_pattern = re.compile(r"\((#[0-9]+)\)$")
+                printed_prs = set()
+                
+                print("### 📈 Merged PRs since last release (" + sys.argv[1] + ")")
+                print("This build includes the following PRs merged since official release " + sys.argv[1] + ":")
+                print("")
+                
+                for c in commits:
+                    msg_first_line = c.get("commit", {}).get("message", "").split("\n")[0]
+                    match = pr_pattern.search(msg_first_line)
+                    if match:
+                        pr_num = match.group(1)
+                        if pr_num not in printed_prs:
+                            printed_prs.add(pr_num)
+                            title = msg_first_line[:match.start()].strip()
+                            author = c.get("author", {})
+                            author_login = author.get("login") if author else None
+                            if not author_login:
+                                author_login = c.get("commit", {}).get("author", {}).get("name", "unknown")
+                            pr_clean = pr_num.lstrip("#")
+                            print(f"- **PR [{pr_num}](https://github.com/screenpipe/screenpipe/pull/{pr_clean})**: {title} (by @{author_login})")
+                
+                if not printed_prs:
+                    print("No PR merge commits found in this ref.")
+            except Exception as e:
+                print(f"Error parsing commits: {e}")
+            ' "$UPSTREAM_TAG" >> $GITHUB_STEP_SUMMARY || true
+          fi
+
+      - name: Fix missing clang_rt.osx (Xcode 26.5 compiler-rt workaround)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "--- Checking clang_rt.osx availability ---"
+          RUNTIME_DIR=$(clang -print-runtime-dir 2>/dev/null || true)
+          echo "Runtime dir: ${RUNTIME_DIR:-<not available>}"
+          if [ -n "$RUNTIME_DIR" ] && [ -f "$RUNTIME_DIR/libclang_rt.osx.a" ]; then
+            echo "clang_rt.osx.a is available at $RUNTIME_DIR"; exit 0
+          fi
+          echo "clang_rt.osx.a NOT found. Searching system..."
+          FOUND=$(find /Applications /Library -name "libclang_rt.osx.a" -maxdepth 12 2>/dev/null | head -3 || true)
+          if [ -n "$FOUND" ]; then
+            echo "Found at:"
+            echo "$FOUND"
+            SRC_DIR=$(dirname "$(echo "$FOUND" | head -1)")
+            if [ -n "$RUNTIME_DIR" ]; then
+              mkdir -p "$RUNTIME_DIR"
+              for f in "$SRC_DIR"/libclang_rt.osx*; do
+                ln -sf "$f" "$RUNTIME_DIR/"
+              done
+              echo "Symlinked compiler-rt from $SRC_DIR to $RUNTIME_DIR"
+              exit 0
+            fi
+          fi
+          echo "Not found in Xcode. Checking actual Xcode clang version dir layout..."
+          CLANG_DIR="/Applications/Xcode_26.5.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang"
+          if [ -d "$CLANG_DIR" ]; then
+            echo "Contents of $CLANG_DIR:"; ls -la "$CLANG_DIR"
+            for ver_dir in "$CLANG_DIR"/*/; do
+              ver=$(basename "$ver_dir")
+              expected="$CLANG_DIR/$ver/lib/darwin"
+              if [ -d "$ver_dir/lib/darwin" ] && ls "$ver_dir/lib/darwin/libclang_rt.osx"* >/dev/null 2>&1; then
+                echo "Found working compiler-rt at $ver_dir/lib/darwin"
+                if [ -n "$RUNTIME_DIR" ]; then
+                  mkdir -p "$RUNTIME_DIR"
+                  for f in "$ver_dir/lib/darwin"/libclang_rt.osx*; do
+                    ln -sf "$f" "$RUNTIME_DIR/"
+                  done
+                  echo "Symlinked to $RUNTIME_DIR"
+                  exit 0
+                fi
+              fi
+            done
+          fi
+          echo "Installing compiler-rt via Homebrew..."
+          brew install llvm 2>&1 | tail -5 || true
+          FOUND=$(find /opt/homebrew/Cellar/llvm /opt/homebrew/opt/llvm -name "libclang_rt.osx.a" -maxdepth 8 2>/dev/null | head -3 || true)
+          if [ -n "$FOUND" ]; then
+            SRC_DIR=$(dirname "$(echo "$FOUND" | head -1)")
+            if [ -n "$RUNTIME_DIR" ]; then
+              mkdir -p "$RUNTIME_DIR"
+              for f in "$SRC_DIR"/libclang_rt.osx*; do
+                ln -sf "$f" "$RUNTIME_DIR/"
+              done
+              echo "Symlinked compiler-rt from Homebrew llvm"
+              exit 0
+            fi
+          fi
+          echo "WARNING: Could not install/find compiler-rt. Build may fail."
+
+      - name: Build (tauri, ad-hoc signed)
+        working-directory: apps/screenpipe-app-tauri
+        shell: bash
+        env:
+          # Do NOT set APPLE_CERTIFICATE at all — even an empty string causes
+          # Tauri's bundler to invoke `security import` which fails with no
+          # real cert in the keychain. Omitting it entirely skips that path.
+          # APPLE_SIGNING_IDENTITY="-" → codesign ad-hoc (no Developer ID needed).
+          APPLE_SIGNING_IDENTITY: "-"
+          # Deliberately NOT setting APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+          # Setting them to empty string still triggers Tauri's notarization path.
+          # Unsetting them entirely causes Tauri to skip notarization.
+          TAURI_SIGNING_PRIVATE_KEY: ""
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          set -euxo pipefail
+          # Wrap cc/c++/xcrun to force -mmacosx-version-min=14.0 - the cc
+          # crate otherwise injects 10.13 which breaks MLX Metal kernels.
+          WRAPPER_DIR="$GITHUB_WORKSPACE/.compiler-wrapper"
+          mkdir -p "$WRAPPER_DIR"
+          for tool in cc c++ xcrun; do
+            REAL=$(/usr/bin/which "$tool")
+            cat > "$WRAPPER_DIR/$tool" <<EOF
+          #!/bin/bash
+          new=()
+          for x in "\$@"; do
+            [[ "\$x" == -mmacosx-version-min=* ]] && x="-mmacosx-version-min=14.0"
+            new+=("\$x")
+          done
+          exec "$REAL" "\${new[@]}"
+          EOF
+            chmod +x "$WRAPPER_DIR/$tool"
+          done
+          export PATH="$WRAPPER_DIR:$PATH"
+
+          bunx tauri build \
+            --target ${{ env.TARGET }} \
+            --features ${{ steps.feats.outputs.features }} \
+            --bundles app,dmg
+
+      - name: Locate build outputs
+        id: out
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
+          APP=$(find "$BUNDLE/macos" -maxdepth 1 -type d -name "*.app" | head -1)
+          DMG=$(find "$BUNDLE/dmg"   -maxdepth 1 -type f -name "*.dmg" | head -1 || true)
+          echo "Found app: $APP"
+          echo "Found dmg: ${DMG:-<none>}"
+          echo "app_path=$APP" >> "$GITHUB_OUTPUT"
+          echo "dmg_path=$DMG" >> "$GITHUB_OUTPUT"
+          # Re-codesign ad-hoc deeply so Gatekeeper doesn't reject the .app
+          # for "modified or has invalid signature" after we patched conf.
+          /usr/bin/codesign --force --deep --sign - "$APP"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP" || true
+
+      - name: Copy DMG for upload (outside source dir)
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/stage"
+          mkdir -p "$STAGE"
+          if [ -n "${{ steps.out.outputs.dmg_path }}" ]; then
+            cp "${{ steps.out.outputs.dmg_path }}" "$STAGE/screenpipe-macos-arm64.dmg"
+          else
+            echo "Error: No DMG path found" >&2
+            exit 1
+          fi
+          ls -lh "$STAGE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: screenpipe-macos-arm64-${{ steps.feats.outputs.version }}
+          path: ${{ runner.temp }}/stage/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: ${{ !github.event.inputs.pr && !github.event.client_payload.pr }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-new-release.outputs.tag }}
+        run: |
+          set -euxo pipefail
+          STAGE="${{ runner.temp }}/stage"
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "Screenpipe $TAG (Free)" \
+              --notes "Bypassed entitlement checks and pre-built with Metal/Apple Intelligence support."
+          fi
+          gh release upload "$TAG" \
+            --repo "${{ github.repository }}" \
+            --clobber \
+            "$STAGE"/*
+
+      - name: Dump tail of build log on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "::group::cargo target dir tree (top level)"
+          ls -la apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/ || true
+          echo "::endgroup::"
+          echo "::group::bundle dir"
+          find apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle -maxdepth 3 -print 2>/dev/null || true
+          echo "::endgroup::"
