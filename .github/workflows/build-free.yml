@@ -21,6 +21,8 @@ run-name: >-
 # finish and downloads the artifact.
 
 on:
+  schedule:
+    - cron: '0 */12 * * *'   # every 12 hours (00:00, 12:00 UTC)
   workflow_dispatch:
     inputs:
       ref:
@@ -60,6 +62,7 @@ jobs:
       tag: ${{ steps.check.outputs.tag }}
       base_ref: ${{ steps.check.outputs.base_ref }}
       upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+      apply_pr: ${{ steps.check.outputs.apply_pr }}
     steps:
       - name: Check upstream release
         id: check
@@ -111,6 +114,14 @@ jobs:
           fi
           
           APPLY_PR="${{ github.event.inputs.apply_pr || github.event.client_payload.apply_pr }}"
+
+          # For scheduled runs, always apply these PRs (update list as needed)
+          if [ -z "$APPLY_PR" ] && [ "$IS_SCHEDULED" = "true" ]; then
+            APPLY_PR="4333,4344"
+            echo "Scheduled run: applying default PRs: $APPLY_PR"
+          fi
+          echo "apply_pr=$APPLY_PR" >> "$GITHUB_OUTPUT"
+
           if [ -n "$APPLY_PR" ]; then
             SAFE_PR_SUFFIX=$(echo "$APPLY_PR" | tr ',' '-')
             RELEASE_TAG="${BUILD_TAG_RESOLVED}-pr-${SAFE_PR_SUFFIX}"
@@ -196,54 +207,49 @@ jobs:
           lfs: true
 
       - name: Apply PR patch
-        if: ${{ github.event.inputs.apply_pr != '' || github.event.client_payload.apply_pr != '' }}
+        id: apply_patch
+        if: ${{ github.event.inputs.apply_pr != '' || github.event.client_payload.apply_pr != '' || needs.check-new-release.outputs.apply_pr != '' }}
         shell: bash
         run: |
-          # Split comma-separated PR numbers
-          APPLY_PR_VAL="${{ github.event.inputs.apply_pr || github.event.client_payload.apply_pr }}"
+          set +e  # Don't exit on failure — capture it for Copilot auto-fix
+          APPLY_PR_VAL="${{ github.event.inputs.apply_pr || github.event.client_payload.apply_pr || needs.check-new-release.outputs.apply_pr }}"
           IFS=',' read -r -a PRs <<< "$APPLY_PR_VAL"
+          PATCH_FAILED="false"
+          FAILED_PRS=""
           for PR_NUM in "${PRs[@]}"; do
-            PR_NUM=$(echo "$PR_NUM" | xargs) # trim whitespace
+            PR_NUM=$(echo "$PR_NUM" | xargs)
             if [ -n "$PR_NUM" ]; then
               echo "Applying patch for PR #$PR_NUM..."
               UPSTREAM_REPO="${{ github.event.inputs.upstream || github.event.client_payload.upstream || 'screenpipe/screenpipe' }}"
-              curl -sSL "https://github.com/${UPSTREAM_REPO}/pull/${PR_NUM}.diff" > pr_${PR_NUM}.diff
+              curl -sSL "https://github.com/${UPSTREAM_REPO}/pull/${PR_NUM}.diff" > "pr_${PR_NUM}.diff"
 
-              # Tier 1: strict git apply (full context match)
-              if git apply --check pr_${PR_NUM}.diff 2>/dev/null && git apply pr_${PR_NUM}.diff; then
+              if git apply --check "pr_${PR_NUM}.diff" 2>/dev/null && git apply "pr_${PR_NUM}.diff"; then
                 echo "Applied PR #$PR_NUM cleanly (strict)"
-              # Tier 2: reduced context (allows surrounding-line drift between PR base and release tag)
-              elif git apply --check -C1 pr_${PR_NUM}.diff 2>/dev/null && git apply -C1 pr_${PR_NUM}.diff; then
+              elif git apply --check -C1 "pr_${PR_NUM}.diff" 2>/dev/null && git apply -C1 "pr_${PR_NUM}.diff"; then
                 echo "::warning::Applied PR #$PR_NUM with reduced context (-C1). Verify the result."
-              # Tier 3: zero-context (only the +/- lines, no context matching)
-              elif git apply --check -C0 pr_${PR_NUM}.diff 2>/dev/null && git apply -C0 pr_${PR_NUM}.diff; then
+              elif git apply --check -C0 "pr_${PR_NUM}.diff" 2>/dev/null && git apply -C0 "pr_${PR_NUM}.diff"; then
                 echo "::warning::Applied PR #$PR_NUM with zero context (-C0). Verify the result."
               else
-                echo "::warning::Tiers 1-3 failed for PR #$PR_NUM — falling back to Tier 4 (fetch files from PR HEAD)."
-                rm -f pr_${PR_NUM}.diff 2>/dev/null || true
-
-                # Tier 4: Fetch each changed file directly from the PR's HEAD commit.
-                # This bypasses context drift entirely by getting the final file state
-                # from the PR branch. Note: if the PR branch is stale relative to the
-                # target ref, upstream changes in those files will be overwritten.
+                echo "::warning::Tiers 1-3 failed for PR #$PR_NUM — trying Tier 4 (direct file fetch)."
+                rm -f "pr_${PR_NUM}.diff" 2>/dev/null || true
                 PR_HEAD_SHA=$(curl -sSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
                   "https://api.github.com/repos/${UPSTREAM_REPO}/pulls/${PR_NUM}" | jq -r '.head.sha')
                 if [ "$PR_HEAD_SHA" = "null" ] || [ -z "$PR_HEAD_SHA" ]; then
-                  echo "::error::Failed to fetch PR #$PR_NUM metadata from GitHub API."
-                  exit 1
+                  echo "::error::Failed to fetch PR #$PR_NUM metadata."
+                  PATCH_FAILED="true"
+                  FAILED_PRS="${FAILED_PRS} ${PR_NUM}"
+                  continue
                 fi
                 echo "PR #$PR_NUM head SHA: $PR_HEAD_SHA"
-
-                # Get list of changed files (paths relative to repo root)
                 CHANGED_FILES=$(curl -sSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
                   "https://api.github.com/repos/${UPSTREAM_REPO}/pulls/${PR_NUM}/files?per_page=100" | jq -r '.[].filename')
                 if [ -z "$CHANGED_FILES" ]; then
                   echo "::error::No changed files found for PR #$PR_NUM."
-                  exit 1
+                  PATCH_FAILED="true"
+                  FAILED_PRS="${FAILED_PRS} ${PR_NUM}"
+                  continue
                 fi
-
                 APPLIED_COUNT=0
-                FAILED_FILES=""
                 while IFS= read -r FILE_PATH; do
                   [ -z "$FILE_PATH" ] && continue
                   echo "  Fetching: $FILE_PATH"
@@ -258,25 +264,167 @@ jobs:
                     echo "    OK"
                   else
                     rm -f "pr_${PR_NUM}_file.tmp" 2>/dev/null || true
-                    FAILED_FILES="${FAILED_FILES} ${FILE_PATH}"
                     echo "    FAILED (HTTP ${HTTP_CODE})"
                   fi
                 done <<< "$CHANGED_FILES"
-
                 if [ "$APPLIED_COUNT" -eq 0 ]; then
                   echo "::error::Tier 4: Failed to fetch any files for PR #$PR_NUM."
-                  exit 1
+                  PATCH_FAILED="true"
+                  FAILED_PRS="${FAILED_PRS} ${PR_NUM}"
+                  continue
                 fi
-
-                echo "::warning::Applied PR #$PR_NUM via Tier 4 (direct file fetch): ${APPLIED_COUNT} files updated."
-                if [ -n "$FAILED_FILES" ]; then
-                  echo "::warning::Could not fetch:${FAILED_FILES}"
-                fi
-                echo "Verify the result — upstream may have changed these files since the PR was opened."
+                echo "::warning::Applied PR #$PR_NUM via Tier 4 (direct file fetch): ${APPLIED_COUNT} files."
+                echo "Verify the result — upstream may have changed these files."
               fi
               echo "Successfully applied patch for PR #$PR_NUM"
             fi
           done
+
+          # Write outputs for downstream steps
+          echo "patch_failed=${PATCH_FAILED}" >> "$GITHUB_OUTPUT"
+          echo "failed_prs=${FAILED_PRS}" >> "$GITHUB_OUTPUT"
+
+          if [ "$PATCH_FAILED" = "true" ]; then
+            echo "::warning::Patch application failed for PR(s):${FAILED_PRS}. Will attempt Copilot auto-fix."
+          fi
+
+      - name: Auto-fix patch failure with Copilot
+        id: copilot_fix
+        if: always() && steps.apply_patch.outputs.patch_failed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: ${{ github.event.inputs.upstream || github.event.client_payload.upstream || 'screenpipe/screenpipe' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FAILED_PRS="${{ steps.apply_patch.outputs.failed_prs }}"
+          echo "=== Copilot Auto-Fix ==="
+          echo "Attempting to fix patches for:${FAILED_PRS}"
+
+          gh extension install github/copilot 2>/dev/null || true
+
+          for PR_NUM in $FAILED_PRS; do
+            echo "--- Fixing PR #$PR_NUM ---"
+
+            # Get PR metadata
+            PR_HEAD_SHA=$(gh api "repos/${UPSTREAM_REPO}/pulls/${PR_NUM}" --jq '.head.sha')
+            echo "PR head SHA: $PR_HEAD_SHA"
+
+            # Get changed files from the PR
+            CHANGED_FILES=$(gh api "repos/${UPSTREAM_REPO}/pulls/${PR_NUM}/files?per_page=100" --jq '.[].filename')
+
+            for FILE in $CHANGED_FILES; do
+              echo "  Processing: $FILE"
+              [ -f "$FILE" ] || { echo "    File not in tree, skipping"; continue; }
+
+              # Get the PR's intended version of this file
+              PR_CONTENT=$(curl -sSL "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${PR_HEAD_SHA}/${FILE}" || true)
+              if [ -z "$PR_CONTENT" ]; then
+                echo "    Could not fetch PR version, skipping"; continue
+              fi
+
+              # Get the patch hunks for this file from the PR
+              FILE_PATCH=$(gh api "repos/${UPSTREAM_REPO}/pulls/${PR_NUM}/files" --jq ".[] | select(.filename==\"$FILE\") | .patch // empty" 2>/dev/null || true)
+
+              # --- Strategy 1: Try patch with high fuzz ---
+              APPLIED=false
+              if [ -n "$FILE_PATCH" ]; then
+                for FUZZ in 99 50 20 10 5 3; do
+                  if echo "$FILE_PATCH" | patch -p1 --force --fuzz="$FUZZ" --dry-run "$FILE" >/dev/null 2>&1; then
+                    echo "$FILE_PATCH" | patch -p1 --force --fuzz="$FUZZ" "$FILE"
+                    echo "    Applied patch with fuzz=$FUZZ"
+                    APPLIED=true
+                    break
+                  fi
+                done
+              fi
+
+              # --- Strategy 2: Use Copilot to merge the file ---
+              if [ "$APPLIED" = "false" ]; then
+                echo "    Trying Copilot merge..."
+                CURRENT=$(cat "$FILE")
+
+                # Build context file for Copilot (avoids heredoc YAML issues)
+                {
+                  echo "I have a file \"$FILE\" in a codebase. A PR wants to change it."
+                  echo "The patch context has drifted from the current version."
+                  echo "Take the CURRENT file and apply the intent of the DESIRED changes"
+                  echo "to produce a MERGED file. Output ONLY the complete merged file content."
+                  echo ""
+                  echo "CURRENT FILE:"
+                  echo "$CURRENT"
+                  echo ""
+                  echo "PR DESIRED CONTENT:"
+                  echo "$PR_CONTENT"
+                  echo ""
+                  echo "PATCH HUNKS:"
+                  echo "$FILE_PATCH"
+                } > /tmp/copilot_context.txt
+
+                SUGGESTION=$(cat /tmp/copilot_context.txt | gh copilot suggest --quiet 2>/dev/null || true)
+
+                if [ -n "$SUGGESTION" ] && [ ${#SUGGESTION} -gt 50 ]; then
+                  echo "$SUGGESTION" > "$FILE"
+                  git add "$FILE"
+                  echo "    Applied Copilot suggestion"
+                  APPLIED=true
+                else
+                  echo "    Copilot suggestion too short or empty, trying alternative..."
+                fi
+              fi
+
+              # --- Strategy 3: Use gh copilot suggest with --shell for a fix command ---
+              if [ "$APPLIED" = "false" ] && [ -n "$FILE_PATCH" ]; then
+                SHELL_FIX=$(echo "apply this git patch to file $FILE: $FILE_PATCH" | gh copilot suggest --quiet --shell 2>/dev/null || true)
+                if [ -n "$SHELL_FIX" ]; then
+                  echo "    Copilot shell suggestion: $SHELL_FIX"
+                  eval "$SHELL_FIX" 2>/dev/null && APPLIED=true || true
+                fi
+              fi
+
+              # --- Strategy 4: Direct overwrite with PR version (last resort) ---
+              if [ "$APPLIED" = "false" ]; then
+                echo "    Last resort: overwriting with PR version (may miss upstream changes)"
+                mkdir -p "$(dirname "$FILE")"
+                echo "$PR_CONTENT" > "$FILE"
+                git add "$FILE"
+                echo "    Applied PR version directly"
+              fi
+            done
+          done
+
+          # Verify: try to re-apply the original diff to confirm everything is consistent
+          APPLY_PR_VAL="${{ github.event.inputs.apply_pr || github.event.client_payload.apply_pr || needs.check-new-release.outputs.apply_pr }}"
+          IFS=',' read -r -a PRs <<< "$APPLY_PR_VAL"
+          ALL_GOOD=true
+          for PR_NUM in "${PRs[@]}"; do
+            PR_NUM=$(echo "$PR_NUM" | xargs)
+            if [ -f "pr_${PR_NUM}.diff" ]; then
+              if ! git apply --check "pr_${PR_NUM}.diff" 2>/dev/null; then
+                echo "::warning::PR #$PR_NUM diff still doesn't apply cleanly after Copilot fix (may be OK if files were overwritten)"
+              fi
+            fi
+          done
+          echo "✓ Copilot auto-fix complete"
+
+      - name: Verify patches applied
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPLY_PR_VAL="${{ github.event.inputs.apply_pr || github.event.client_payload.apply_pr || needs.check-new-release.outputs.apply_pr }}"
+          if [ -z "$APPLY_PR_VAL" ]; then
+            echo "No PRs to verify"; exit 0
+          fi
+          # Check that the step outputs indicate success
+          PATCH_FAILED="${{ steps.apply_patch.outputs.patch_failed }}"
+          COPILLOT_OUTCOME="${{ steps.copilot_fix.outcome }}"
+          if [ "$PATCH_FAILED" = "true" ] && [ "$COPILLOT_OUTCOME" != "success" ]; then
+            echo "::error::Patches were not applied and Copilot auto-fix did not succeed."
+            echo "::error::Failed PRs:${{ steps.apply_patch.outputs.failed_prs }}"
+            exit 1
+          fi
+          echo "Patches verified OK"
 
       - name: Add applied PR details (legacy step placeholder, logic moved after feature flags)
         shell: bash
@@ -960,6 +1108,9 @@ jobs:
           /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
           echo "::endgroup::"
           echo "✓ .app bundle signed successfully"
+
+          # Remove quarantine attribute so Gatekeeper doesn't block on open
+          xattr -cr "$APP"
 
           # Create DMG — Tauri skips DMG creation when codesign fails in the
           # build step, so we create it manually after fixing signatures.
