@@ -511,17 +511,42 @@ jobs:
             const fs = require("fs");
             const f = process.argv[1];
             let c = fs.readFileSync(f, "utf8");
-            const idx = c.indexOf("let is_pro = SettingsStore::get(&app_handle)");
-            if (idx === -1) {
+            let patched = false;
+
+            // Try new pattern: let is_pro = settings.user.cloud_subscribed == Some(true);
+            const newTarget = "let is_pro = settings.user.cloud_subscribed == Some(true);";
+            const newIdx = c.indexOf(newTarget);
+            if (newIdx !== -1) {
+              c = c.slice(0, newIdx) + "let is_pro = true;" + c.slice(newIdx + newTarget.length);
+              patched = true;
+            }
+
+            // Try legacy pattern: let is_pro = SettingsStore::get(&app_handle)...== Some(true);
+            if (!patched) {
+              const legacyIdx = c.indexOf("let is_pro = SettingsStore::get(&app_handle)");
+              if (legacyIdx !== -1) {
+                const endIdx = c.indexOf("== Some(true);", legacyIdx);
+                if (endIdx !== -1) {
+                  c = c.slice(0, legacyIdx) + "let is_pro = true;" + c.slice(endIdx + "== Some(true);".length);
+                  patched = true;
+                }
+              }
+            }
+
+            // Try broader pattern: any let is_pro = ... == Some(true);
+            if (!patched) {
+              const broadTarget = /let is_pro = .* == Some\(true\);/g;
+              if (broadTarget.test(c)) {
+                c = c.replace(broadTarget, "let is_pro = true;");
+                patched = true;
+              }
+            }
+
+            if (!patched) {
               console.error("Target is_pro in oauth.rs not found!");
               process.exit(1);
             }
-            const endIdx = c.indexOf("== Some(true);", idx);
-            if (endIdx === -1) {
-              console.error("End of statement not found!");
-              process.exit(1);
-            }
-            c = c.slice(0, idx) + "let is_pro = true;" + c.slice(endIdx + "== Some(true);".length);
+
             fs.writeFileSync(f, c, "utf8");
             console.log("oauth.rs patched successfully.");
           ' "$OAUTH_FILE"
