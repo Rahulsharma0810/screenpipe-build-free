@@ -27,6 +27,15 @@ add_spctl_exception() {
     log "Gatekeeper exception added via spctl"
     return 0
   fi
+  # macOS 26+ removed both `spctl --add` and CLI `profiles install`.
+  # A locally-signed app still launches via first-open provenance; there is no
+  # supported CLI path to allowlist it. Skip the profile attempt on modern macOS.
+  local osmajor
+  osmajor=$(sw_vers -productVersion | cut -d. -f1)
+  if [ "${osmajor:-0}" -ge 15 ]; then
+    log "macOS ${osmajor}: no CLI Gatekeeper allowlist available; app relies on local signature + first-open trust. OK."
+    return 0
+  fi
   # Method 2: Configuration profile (macOS 15+)
   local profile_path
   profile_path=$(mktemp /tmp/screenpipe-gk.XXXXXX.mobileconfig)
@@ -175,11 +184,41 @@ xattr -cr "$APP_PATH" 2>/dev/null || $SUDO xattr -cr "$APP_PATH"
 hdiutil detach "$MOUNT_DIR" >/dev/null 2>&1
 
 # --- Re-sign with stable identity to preserve TCC permissions ---
+# NOTE: `codesign --deep` is unreliable for RE-signing nested binaries — it can
+# silently skip nested Mach-O helpers. We sign inside-out: every nested Mach-O
+# binary/dylib individually first, then the outer bundle last.
 IDENTITY="Screenpipe Local Dev"
+
+sign_inside_out() {
+  local app="$1"
+  local rc=0
+  # Sign nested Mach-O binaries (helpers, dylibs) first. Skip 0-byte files
+  # (e.g. placeholder dylibs shipped empty by the build) and non-Mach-O data.
+  while IFS= read -r f; do
+    [ -s "$f" ] || { log "  skip empty: ${f#$app/}"; continue; }
+    if file "$f" 2>/dev/null | grep -q "Mach-O"; then
+      if ! $SUDO codesign --force --timestamp=none --sign "$IDENTITY" "$f" 2>>"$LOG_FILE"; then
+        log "  FAILED to sign: ${f#$app/}"
+        rc=1
+      fi
+    fi
+  done < <(find "$app/Contents" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) 2>/dev/null)
+  # Sign the outer bundle last.
+  if ! $SUDO codesign --force --timestamp=none --sign "$IDENTITY" "$app" 2>>"$LOG_FILE"; then
+    log "  FAILED to sign bundle"
+    rc=1
+  fi
+  return $rc
+}
+
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
-  log "Re-signing with '$IDENTITY' to preserve TCC permissions..."
-  if $SUDO codesign --force --deep --sign "$IDENTITY" "$APP_PATH" 2>&1 | tee -a "$LOG_FILE"; then
-    log "Re-signed successfully"
+  log "Re-signing (inside-out) with '$IDENTITY' to preserve TCC permissions..."
+  if sign_inside_out "$APP_PATH"; then
+    if $SUDO codesign --verify --deep --strict "$APP_PATH" 2>>"$LOG_FILE"; then
+      log "Re-signed and verified successfully"
+    else
+      log "WARNING: signed but strict verification reported issues (see log)"
+    fi
     add_spctl_exception "$APP_PATH"
   else
     log "WARNING: Re-sign failed, resetting TCC permissions..."
