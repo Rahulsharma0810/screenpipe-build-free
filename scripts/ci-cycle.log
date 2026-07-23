@@ -1,0 +1,2 @@
+2026-07-18T20:59:20Z | CYCLE COMPLETE | run=29659320271 | tag=app-v2.5.120 | status=SUCCESS | installed=2.5.120 | signed=yes | running=yes
+2026-07-23T07:17:03Z | CYCLE COMPLETE | run=29980467679 | tag=app-v2.5.132-pr-4333-4344 | status=BUILD_SUCCESS | fix=oauth.rs-patch-tolerant(f012d58) | installed=BLOCKED(root-owned app needs sudo) | signed=no | running=no
