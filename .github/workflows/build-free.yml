@@ -1116,7 +1116,7 @@ jobs:
             --bundles app,dmg || true
           echo "::endgroup::"
 
-      - name: Repair empty/missing libonnxruntime.dylib in bundle
+      - name: Repair bundle (onnxruntime dylib + embedded version)
         # KNOWN DEFECT: ort's resource copy has been observed to drop a 0-byte
         # libonnxruntime.dylib into Contents/MacOS/, which makes every ONNX-backed
         # feature (embeddings, OCR/vision models) fail at runtime with a dyld error.
@@ -1138,18 +1138,33 @@ jobs:
           fi
           DEST="$APP/Contents/MacOS/libonnxruntime.dylib"
 
+          # is_real_dylib: true only for a genuine dynamic library — NOT a 0-byte
+          # placeholder and NOT the .dSYM debug-symbols companion (which also
+          # reports "Mach-O" via file(1) but cannot be dlopen'd at runtime).
+          is_real_dylib() {
+            [ -s "$1" ] || return 1
+            local d; d=$(file -b "$1" 2>/dev/null)
+            case "$d" in
+              *"dSYM companion"*) return 1 ;;
+              *"dynamically linked shared library"*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
           needs_repair=1
-          if [ -f "$DEST" ] && [ -s "$DEST" ] && file "$DEST" | grep -q 'Mach-O'; then
-            echo "libonnxruntime.dylib present and non-empty ($(stat -f%z "$DEST") bytes) — no repair needed."
+          if is_real_dylib "$DEST"; then
+            echo "libonnxruntime.dylib present and valid ($(stat -f%z "$DEST") bytes) — no repair needed."
             needs_repair=0
           fi
 
           if [ "$needs_repair" -eq 1 ]; then
             echo "Repairing libonnxruntime.dylib (current: $( [ -f "$DEST" ] && stat -f%z "$DEST" || echo missing ) bytes)"
-            # 1) Look for a real, non-empty dylib produced by the ort build under target/.
+            # 1) Look for a real, non-empty dylib produced by the ort build under
+            #    target/, excluding dSYM companions and dSYM bundle paths.
             REAL=$(find "$TARGET_ROOT" src-tauri/target -type f \
                      \( -name 'libonnxruntime*.dylib' -o -name 'onnxruntime*.dylib' \) 2>/dev/null \
-                   | while read -r f; do [ -s "$f" ] && file "$f" | grep -q 'Mach-O' && echo "$f"; done \
+                   | grep -v '\.dSYM/' \
+                   | while read -r f; do is_real_dylib "$f" && echo "$f"; done \
                    | head -1 || true)
             if [ -n "$REAL" ]; then
               echo "Found real dylib in target tree: $REAL"
@@ -1161,15 +1176,42 @@ jobs:
               URL="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_ONNX_VERSION}/onnxruntime-osx-arm64-${ORT_ONNX_VERSION}.tgz"
               curl -fL --retry 3 -o "$TMP/ort.tgz" "$URL"
               tar -xzf "$TMP/ort.tgz" -C "$TMP"
-              DL=$(find "$TMP" -name 'libonnxruntime*.dylib' -type f | while read -r f; do [ -s "$f" ] && echo "$f"; done | head -1)
+              # Official tarball ships lib/libonnxruntime.<ver>.dylib (a symlink)
+              # plus the real versioned file. Pick the real shared library and
+              # explicitly skip the .dSYM companion under the same lib/ dir.
+              DL=$(find "$TMP" -path '*/lib/*' -name 'libonnxruntime*.dylib' -type f 2>/dev/null \
+                   | grep -v '\.dSYM/' \
+                   | while read -r f; do is_real_dylib "$f" && echo "$f"; done \
+                   | sort | tail -1)
               if [ -z "$DL" ]; then
                 echo "::error::Failed to obtain a valid libonnxruntime.dylib." ; exit 1
               fi
+              echo "Selected: $DL"
               cp -f "$DL" "$DEST"
               rm -rf "$TMP"
             fi
+            if ! is_real_dylib "$DEST"; then
+              echo "::error::Repaired file is still not a valid shared library: $(file -b "$DEST")"
+              exit 1
+            fi
             echo "Repaired: $(stat -f%z "$DEST") bytes"
             file "$DEST"
+          fi
+
+          # Pin the bundle's embedded version in the FINISHED bundle. tauri build
+          # caches the compiled binary (which carries Info.plist via build.rs), so
+          # config-level pinning alone can leave a stale Info.plist. Patch it here.
+          PIN_VER=$(printf '%s' "${{ needs.check-new-release.outputs.upstream_tag }}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          if [ -n "$PIN_VER" ]; then
+            PLIST="$APP/Contents/Info.plist"
+            cur=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" 2>/dev/null || echo "?")
+            if [ "$cur" != "$PIN_VER" ]; then
+              echo "Patching Info.plist version $cur -> $PIN_VER"
+              /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $PIN_VER" "$PLIST"
+              /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $PIN_VER" "$PLIST"
+            else
+              echo "Info.plist version already $PIN_VER"
+            fi
           fi
 
       - name: Sign .app bundle
