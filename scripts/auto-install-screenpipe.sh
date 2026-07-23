@@ -196,18 +196,24 @@ sign_inside_out() {
   _sign_one() {
     local f="$1"
     [ -s "$f" ] || { log "  skip empty: ${f#$app/}"; return; }
-    file "$f" 2>/dev/null | grep -q "Mach-O" || return
+    # Sign Mach-O objects and Metal libraries. codesign treats every file under
+    # Contents/MacOS/ as nested code and refuses to seal the main executable if a
+    # sibling (e.g. mlx.metallib) is unsigned. .metallib files are signable code.
+    case "$f" in
+      *.metallib) : ;;
+      *) file "$f" 2>/dev/null | grep -q "Mach-O" || return ;;
+    esac
     if ! $SUDO codesign --force --timestamp=none --sign "$IDENTITY" "$f" 2>>"$LOG_FILE"; then
       log "  FAILED to sign: ${f#$app/}"
       rc=1
     fi
   }
-  # Pass 1: libraries first (*.dylib, *.so). Executables that link these
-  # libraries require them to already be signed, else codesign errors with
+  # Pass 1: libraries first (*.dylib, *.so, *.metallib). Executables that link/
+  # reference these require them to already be signed, else codesign errors with
   # "code object is not signed at all".
-  while IFS= read -r f; do _sign_one "$f"; done < <(find "$app/Contents" -type f \( -name "*.dylib" -o -name "*.so" \) 2>/dev/null)
+  while IFS= read -r f; do _sign_one "$f"; done < <(find "$app/Contents" -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.metallib" \) 2>/dev/null)
   # Pass 2: remaining executables.
-  while IFS= read -r f; do _sign_one "$f"; done < <(find "$app/Contents" -type f -perm -111 ! -name "*.dylib" ! -name "*.so" 2>/dev/null)
+  while IFS= read -r f; do _sign_one "$f"; done < <(find "$app/Contents" -type f -perm -111 ! -name "*.dylib" ! -name "*.so" ! -name "*.metallib" 2>/dev/null)
   # Sign the outer bundle last.
   if ! $SUDO codesign --force --timestamp=none --sign "$IDENTITY" "$app" 2>>"$LOG_FILE"; then
     log "  FAILED to sign bundle"
