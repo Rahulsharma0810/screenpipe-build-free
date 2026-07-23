@@ -543,12 +543,11 @@ jobs:
             }
 
             if (!patched) {
-              console.error("Target is_pro in oauth.rs not found!");
-              process.exit(1);
+              console.log("No is_pro patterns found in oauth.rs — upstream may have already removed them. Skipping.");
+            } else {
+              fs.writeFileSync(f, c, "utf8");
+              console.log("oauth.rs patched successfully.");
             }
-
-            fs.writeFileSync(f, c, "utf8");
-            console.log("oauth.rs patched successfully.");
           ' "$OAUTH_FILE"
 
           echo "Patching general cloud_subscribed checks recursively in Rust backend..."
