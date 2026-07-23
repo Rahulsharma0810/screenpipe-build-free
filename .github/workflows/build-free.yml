@@ -841,6 +841,37 @@ jobs:
           echo "--- patched bundle/macOS block ---"
           jq '.bundle.macOS, .plugins.updater // "removed"' "$CONF"
 
+      - name: Pin bundle version to release tag (fix stale embedded version)
+        # The upstream release TAG (e.g. app-v2.5.132) is the source of truth for
+        # what version we are shipping, but the bundle version has been observed to
+        # drift (a stale value like 2.5.120 gets baked in from a cached compile, or
+        # upstream Cargo.toml lags the tag). Force both tauri.conf.json AND Cargo.toml
+        # to the tag's semver so CFBundleShortVersionString matches the release.
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-new-release.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          CONF=apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+          CARGO_TOML=apps/screenpipe-app-tauri/src-tauri/Cargo.toml
+          # Extract a clean X.Y.Z from the tag (strip any leading prefix like "app-v").
+          PIN_VER=$(printf '%s' "$UPSTREAM_TAG" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ -z "$PIN_VER" ]; then
+            echo "::warning::Could not derive semver from tag '$UPSTREAM_TAG'; leaving version untouched."
+            exit 0
+          fi
+          echo "Pinning bundle version to $PIN_VER (from tag $UPSTREAM_TAG)"
+          tmp=$(mktemp)
+          jq --arg v "$PIN_VER" '.version = $v' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+          # Update the first (package) version line in Cargo.toml so any Cargo-derived
+          # version path also reports the pinned value.
+          if grep -qE '^version = "' "$CARGO_TOML"; then
+            perl -0pi -e 's/^version = "[^"]*"/version = "'"$PIN_VER"'"/m' "$CARGO_TOML"
+          fi
+          echo "--- pinned versions ---"
+          jq '.version' "$CONF"
+          grep -m1 '^version = ' "$CARGO_TOML"
+
       - name: Force rebuild of screenpipe-app binary (bust stale tauri config cache)
         # Tauri embeds tauri.conf.json into the binary at compile time via
         # build.rs. The Rust cache stores the compiled binary, so patching
@@ -1085,6 +1116,62 @@ jobs:
             --bundles app,dmg || true
           echo "::endgroup::"
 
+      - name: Repair empty/missing libonnxruntime.dylib in bundle
+        # KNOWN DEFECT: ort's resource copy has been observed to drop a 0-byte
+        # libonnxruntime.dylib into Contents/MacOS/, which makes every ONNX-backed
+        # feature (embeddings, OCR/vision models) fail at runtime with a dyld error.
+        # Repair it: prefer the real dylib produced under the cargo target tree by
+        # the `ort` build (download-binaries), else download the official ONNX
+        # Runtime release for arm64.
+        working-directory: apps/screenpipe-app-tauri
+        shell: bash
+        env:
+          ORT_ONNX_VERSION: "1.22.0"
+        run: |
+          set -euo pipefail
+          TARGET_ROOT="src-tauri/target/${{ env.TARGET }}/release"
+          BUNDLE="$TARGET_ROOT/bundle"
+          APP=$(find "$BUNDLE/macos" -maxdepth 1 -type d -name "*.app" | head -1)
+          if [ -z "$APP" ]; then
+            echo "::warning::No .app bundle found; skipping onnxruntime repair."
+            exit 0
+          fi
+          DEST="$APP/Contents/MacOS/libonnxruntime.dylib"
+
+          needs_repair=1
+          if [ -f "$DEST" ] && [ -s "$DEST" ] && file "$DEST" | grep -q 'Mach-O'; then
+            echo "libonnxruntime.dylib present and non-empty ($(stat -f%z "$DEST") bytes) — no repair needed."
+            needs_repair=0
+          fi
+
+          if [ "$needs_repair" -eq 1 ]; then
+            echo "Repairing libonnxruntime.dylib (current: $( [ -f "$DEST" ] && stat -f%z "$DEST" || echo missing ) bytes)"
+            # 1) Look for a real, non-empty dylib produced by the ort build under target/.
+            REAL=$(find "$TARGET_ROOT" src-tauri/target -type f \
+                     \( -name 'libonnxruntime*.dylib' -o -name 'onnxruntime*.dylib' \) 2>/dev/null \
+                   | while read -r f; do [ -s "$f" ] && file "$f" | grep -q 'Mach-O' && echo "$f"; done \
+                   | head -1 || true)
+            if [ -n "$REAL" ]; then
+              echo "Found real dylib in target tree: $REAL"
+              cp -f "$REAL" "$DEST"
+            else
+              # 2) Fall back to the official ONNX Runtime arm64 release tarball.
+              echo "No usable dylib in target tree; downloading ONNX Runtime $ORT_ONNX_VERSION (arm64)..."
+              TMP=$(mktemp -d)
+              URL="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_ONNX_VERSION}/onnxruntime-osx-arm64-${ORT_ONNX_VERSION}.tgz"
+              curl -fL --retry 3 -o "$TMP/ort.tgz" "$URL"
+              tar -xzf "$TMP/ort.tgz" -C "$TMP"
+              DL=$(find "$TMP" -name 'libonnxruntime*.dylib' -type f | while read -r f; do [ -s "$f" ] && echo "$f"; done | head -1)
+              if [ -z "$DL" ]; then
+                echo "::error::Failed to obtain a valid libonnxruntime.dylib." ; exit 1
+              fi
+              cp -f "$DL" "$DEST"
+              rm -rf "$TMP"
+            fi
+            echo "Repaired: $(stat -f%z "$DEST") bytes"
+            file "$DEST"
+          fi
+
       - name: Sign .app bundle
         working-directory: apps/screenpipe-app-tauri
         shell: bash
@@ -1103,29 +1190,28 @@ jobs:
           echo "=== Contents before signing ==="
           ls -la "$APP/Contents/MacOS/" | head -20
 
-          # Sign all dylibs in Contents/MacOS/ (where libonnxruntime.dylib lives)
-          echo "::group::Signing Contents/MacOS dylibs"
-          find "$APP/Contents/MacOS" -name "*.dylib" -print0 | while IFS= read -r -d '' d; do
-            echo "Signing: $(basename "$d")"
-            codesign --force --sign - "$d"
-          done || true
+          # Inside-out signing. `codesign --deep` silently skips or mis-signs
+          # nested Mach-O helpers (bun, ffmpeg, ffprobe, dylibs), which then fail
+          # --deep --strict verification. Sign every nested Mach-O individually
+          # (skipping 0-byte placeholders and non-Mach-O data files), then sign
+          # the outer bundle last.
+          echo "::group::Inside-out signing nested Mach-O objects"
+          find "$APP/Contents" -type f \
+            \( -perm -u+x -o -name '*.dylib' -o -name '*.so' \) -print0 \
+          | while IFS= read -r -d '' f; do
+              # Skip empty files and anything that is not a real Mach-O object.
+              [ -s "$f" ] || { echo "skip (empty): $(basename "$f")"; continue; }
+              if ! file "$f" | grep -q 'Mach-O'; then
+                echo "skip (not Mach-O): $(basename "$f")"; continue
+              fi
+              echo "Signing: ${f#$APP/}"
+              codesign --force --timestamp=none --sign - "$f"
+            done
           echo "::endgroup::"
 
-          # Sign all dylibs and frameworks in Contents/Frameworks/
-          echo "::group::Signing Contents/Frameworks"
-          find "$APP/Contents/Frameworks" -name "*.dylib" -print0 2>/dev/null | while IFS= read -r -d '' d; do
-            echo "Signing: $(basename "$d")"
-            codesign --force --sign - "$d"
-          done || true
-          find "$APP/Contents/Frameworks" -name "*.framework" -maxdepth 1 -print0 2>/dev/null | while IFS= read -r -d '' fw; do
-            echo "Signing: $(basename "$fw")"
-            codesign --force --sign - "$fw"
-          done || true
-          echo "::endgroup::"
-
-          # Deep-sign the entire .app bundle (signs main binary + catches anything left)
-          echo "Deep-signing .app bundle ..."
-          /usr/bin/codesign --force --deep --sign - "$APP"
+          # Sign the outer bundle last so its seal covers all nested signatures.
+          echo "Signing .app bundle ..."
+          /usr/bin/codesign --force --timestamp=none --sign - "$APP"
 
           # Verify
           echo "::group::Signature verification"
