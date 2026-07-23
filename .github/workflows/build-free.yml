@@ -1268,6 +1268,14 @@ jobs:
            | while IFS= read -r -d '' f; do sign_one "$f"; done
           echo "::endgroup::"
 
+          # Clear quarantine BEFORE signing. We must NOT run `xattr -cr` after
+          # signing: for non-Mach-O signables like mlx.metallib, codesign stores
+          # the signature in extended attributes (com.apple.cs.*). A blanket
+          # `xattr -cr` would strip those and leave metallib "not signed at all",
+          # which fails --deep --strict once packaged into the DMG. Only remove
+          # the quarantine attribute, and do it first.
+          xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+
           # Sign the outer bundle last so its seal covers all nested signatures.
           echo "Signing .app bundle ..."
           /usr/bin/codesign --force --timestamp=none --sign - "$APP"
@@ -1277,9 +1285,6 @@ jobs:
           /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
           echo "::endgroup::"
           echo "✓ .app bundle signed successfully"
-
-          # Remove quarantine attribute so Gatekeeper doesn't block on open
-          xattr -cr "$APP"
 
           # Create DMG — Tauri skips DMG creation when codesign fails in the
           # build step, so we create it manually after fixing signatures.

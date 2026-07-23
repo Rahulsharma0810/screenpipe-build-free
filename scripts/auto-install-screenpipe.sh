@@ -177,8 +177,10 @@ $SUDO cp -R "$MOUNT_DIR/screenpipe.app" "$APP_PATH"
 # Take ownership so future updates don't require sudo
 $SUDO chown -R "$(id -u):$(id -g)" "$APP_PATH" 2>/dev/null || true
 
-# Remove quarantine attribute
-xattr -cr "$APP_PATH" 2>/dev/null || $SUDO xattr -cr "$APP_PATH"
+# Remove ONLY the quarantine attribute. Never `xattr -cr` here: signing runs
+# after this, and for non-Mach-O signables (mlx.metallib) codesign stores its
+# signature in com.apple.cs.* xattrs — a blanket clear would strip them.
+xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || $SUDO xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || true
 
 # Unmount
 hdiutil detach "$MOUNT_DIR" >/dev/null 2>&1
