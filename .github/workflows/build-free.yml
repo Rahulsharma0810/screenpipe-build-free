@@ -1196,17 +1196,25 @@ jobs:
           # (skipping 0-byte placeholders and non-Mach-O data files), then sign
           # the outer bundle last.
           echo "::group::Inside-out signing nested Mach-O objects"
-          find "$APP/Contents" -type f \
-            \( -perm -u+x -o -name '*.dylib' -o -name '*.so' \) -print0 \
-          | while IFS= read -r -d '' f; do
-              # Skip empty files and anything that is not a real Mach-O object.
-              [ -s "$f" ] || { echo "skip (empty): $(basename "$f")"; continue; }
-              if ! file "$f" | grep -q 'Mach-O'; then
-                echo "skip (not Mach-O): $(basename "$f")"; continue
-              fi
-              echo "Signing: ${f#$APP/}"
-              codesign --force --timestamp=none --sign - "$f"
-            done
+          # sign_one: sign a single file if it is a non-empty Mach-O object.
+          sign_one() {
+            f="$1"
+            [ -s "$f" ] || { echo "skip (empty): $(basename "$f")"; return; }
+            if ! file "$f" | grep -q 'Mach-O'; then
+              echo "skip (not Mach-O): $(basename "$f")"; return
+            fi
+            echo "Signing: ${f#$APP/}"
+            codesign --force --timestamp=none --sign - "$f"
+          }
+          # Pass 1: sign libraries FIRST (*.dylib, *.so). Executables that link
+          # these libraries require the libraries to already carry a signature,
+          # otherwise codesign fails with "code object is not signed at all".
+          find "$APP/Contents" -type f \( -name '*.dylib' -o -name '*.so' \) -print0 \
+          | while IFS= read -r -d '' f; do sign_one "$f"; done
+          # Pass 2: sign remaining executables (Mach-O without .dylib/.so suffix).
+          find "$APP/Contents" -type f -perm -u+x \
+            ! -name '*.dylib' ! -name '*.so' -print0 \
+          | while IFS= read -r -d '' f; do sign_one "$f"; done
           echo "::endgroup::"
 
           # Sign the outer bundle last so its seal covers all nested signatures.

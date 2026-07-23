@@ -192,17 +192,22 @@ IDENTITY="Screenpipe Local Dev"
 sign_inside_out() {
   local app="$1"
   local rc=0
-  # Sign nested Mach-O binaries (helpers, dylibs) first. Skip 0-byte files
-  # (e.g. placeholder dylibs shipped empty by the build) and non-Mach-O data.
-  while IFS= read -r f; do
-    [ -s "$f" ] || { log "  skip empty: ${f#$app/}"; continue; }
-    if file "$f" 2>/dev/null | grep -q "Mach-O"; then
-      if ! $SUDO codesign --force --timestamp=none --sign "$IDENTITY" "$f" 2>>"$LOG_FILE"; then
-        log "  FAILED to sign: ${f#$app/}"
-        rc=1
-      fi
+  # sign_one: sign a single non-empty Mach-O file.
+  _sign_one() {
+    local f="$1"
+    [ -s "$f" ] || { log "  skip empty: ${f#$app/}"; return; }
+    file "$f" 2>/dev/null | grep -q "Mach-O" || return
+    if ! $SUDO codesign --force --timestamp=none --sign "$IDENTITY" "$f" 2>>"$LOG_FILE"; then
+      log "  FAILED to sign: ${f#$app/}"
+      rc=1
     fi
-  done < <(find "$app/Contents" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) 2>/dev/null)
+  }
+  # Pass 1: libraries first (*.dylib, *.so). Executables that link these
+  # libraries require them to already be signed, else codesign errors with
+  # "code object is not signed at all".
+  while IFS= read -r f; do _sign_one "$f"; done < <(find "$app/Contents" -type f \( -name "*.dylib" -o -name "*.so" \) 2>/dev/null)
+  # Pass 2: remaining executables.
+  while IFS= read -r f; do _sign_one "$f"; done < <(find "$app/Contents" -type f -perm -111 ! -name "*.dylib" ! -name "*.so" 2>/dev/null)
   # Sign the outer bundle last.
   if ! $SUDO codesign --force --timestamp=none --sign "$IDENTITY" "$app" 2>>"$LOG_FILE"; then
     log "  FAILED to sign bundle"
