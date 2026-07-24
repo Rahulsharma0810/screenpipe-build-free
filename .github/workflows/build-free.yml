@@ -1214,6 +1214,23 @@ jobs:
             fi
           fi
 
+          # Ensure TCC usage-description keys exist BEFORE signing. macOS can
+          # silently drop or fail to persist a permission grant when the matching
+          # Usage-Description string is missing. Upstream ships Mic + ScreenCapture
+          # but omits Camera / Accessibility / AppleEvents, which screenpipe touches.
+          PLIST="$APP/Contents/Info.plist"
+          ensure_usage_key() {
+            local key="$1" msg="$2"
+            if ! /usr/libexec/PlistBuddy -c "Print :$key" "$PLIST" >/dev/null 2>&1; then
+              /usr/libexec/PlistBuddy -c "Add :$key string $msg" "$PLIST" && echo "  added $key"
+            fi
+          }
+          ensure_usage_key "NSMicrophoneUsageDescription"    "This app requires microphone access to record audio."
+          ensure_usage_key "NSScreenCaptureUsageDescription" "This app requires screen capture access to record the screen."
+          ensure_usage_key "NSCameraUsageDescription"        "This app requires camera access to record video."
+          ensure_usage_key "NSAccessibilityUsageDescription" "This app requires accessibility access to capture UI activity."
+          ensure_usage_key "NSAppleEventsUsageDescription"   "This app uses Apple Events to integrate with other apps."
+
       - name: Sign .app bundle
         working-directory: apps/screenpipe-app-tauri
         shell: bash

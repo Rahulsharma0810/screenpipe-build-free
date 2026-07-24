@@ -185,6 +185,29 @@ xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || $SUDO xattr -dr com.ap
 # Unmount
 hdiutil detach "$MOUNT_DIR" >/dev/null 2>&1
 
+# --- Ensure TCC usage-description keys exist (must be set BEFORE signing) ---
+# macOS can silently drop or fail to persist a permission grant when the
+# corresponding Usage-Description string is absent. The upstream bundle ships
+# Mic + ScreenCapture strings but omits Camera / Accessibility / AppleEvents,
+# all of which screenpipe touches. Add any missing ones so grants stick across
+# updates instead of re-prompting.
+INFO_PLIST="$APP_PATH/Contents/Info.plist"
+ensure_usage_key() {
+  local key="$1" msg="$2"
+  if ! /usr/libexec/PlistBuddy -c "Print :$key" "$INFO_PLIST" >/dev/null 2>&1; then
+    if $SUDO /usr/libexec/PlistBuddy -c "Add :$key string $msg" "$INFO_PLIST" 2>>"$LOG_FILE"; then
+      log "  added Info.plist key: $key"
+    else
+      log "  WARNING: could not add Info.plist key: $key"
+    fi
+  fi
+}
+ensure_usage_key "NSMicrophoneUsageDescription"    "This app requires microphone access to record audio."
+ensure_usage_key "NSScreenCaptureUsageDescription" "This app requires screen capture access to record the screen."
+ensure_usage_key "NSCameraUsageDescription"        "This app requires camera access to record video."
+ensure_usage_key "NSAccessibilityUsageDescription" "This app requires accessibility access to capture UI activity."
+ensure_usage_key "NSAppleEventsUsageDescription"   "This app uses Apple Events to integrate with other apps."
+
 # --- Re-sign with stable identity to preserve TCC permissions ---
 # NOTE: `codesign --deep` is unreliable for RE-signing nested binaries — it can
 # silently skip nested Mach-O helpers. We sign inside-out: every nested Mach-O
