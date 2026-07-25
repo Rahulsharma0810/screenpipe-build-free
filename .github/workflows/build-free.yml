@@ -874,19 +874,26 @@ jobs:
 
       - name: Force rebuild of screenpipe-app binary (bust stale tauri config cache)
         # Tauri embeds tauri.conf.json into the binary at compile time via
-        # build.rs. The Rust cache stores the compiled binary, so patching
-        # the conf AFTER cache restore has no effect. We delete the cached
-        # screenpipe-app artefacts so cargo relinks with the patched config.
+        # build.rs, and main.rs bakes env!("CARGO_PKG_VERSION"). The Rust cache
+        # stores the compiled crate UNITS (deps/*.o, *.rlib) — not just the final
+        # binary — so removing only the binary/fingerprint let cargo relink from
+        # stale objects, keeping an old embedded version (e.g. 2.5.120). Use
+        # `cargo clean -p screenpipe-app` to authoritatively drop the crate's own
+        # compiled units so it fully recompiles with the patched Cargo.toml/conf.
         shell: bash
+        working-directory: apps/screenpipe-app-tauri/src-tauri
         run: |
-          TARGET_DIR="apps/screenpipe-app-tauri/src-tauri/target/${{ env.TARGET }}/release"
-          echo "Removing stale screenpipe-app binaries to force recompile with patched config..."
-          rm -f  "$TARGET_DIR/screenpipe-app"
-          rm -f  "$TARGET_DIR/screenpipe-app.d"
-          rm -rf "$TARGET_DIR/build/screenpipe-app-"*
-          rm -rf "$TARGET_DIR/.fingerprint/screenpipe-app-"*
-          rm -rf "$TARGET_DIR/incremental/screenpipe-app-"*
-          echo "Done. Cargo will recompile screenpipe-app with fresh tauri.conf.json."
+          set -euo pipefail
+          echo "cargo clean -p screenpipe-app (force full recompile of the app crate)"
+          cargo clean -p screenpipe-app --release --target "${{ env.TARGET }}" 2>/dev/null || cargo clean -p screenpipe-app 2>/dev/null || true
+          TARGET_DIR="target/${{ env.TARGET }}/release"
+          # Belt-and-suspenders: remove any lingering app-crate artefacts + deps objects.
+          rm -f  "$TARGET_DIR/screenpipe-app" "$TARGET_DIR/screenpipe-app.d" 2>/dev/null || true
+          rm -rf "$TARGET_DIR/build/screenpipe-app-"* 2>/dev/null || true
+          rm -rf "$TARGET_DIR/.fingerprint/screenpipe-app-"* 2>/dev/null || true
+          rm -rf "$TARGET_DIR/incremental/screenpipe-app-"* 2>/dev/null || true
+          rm -f  "$TARGET_DIR/deps/screenpipe_app-"* 2>/dev/null || true
+          echo "Done. Cargo will fully recompile screenpipe-app (embedded version + config)."
 
       - name: Compute feature flags
         id: feats
