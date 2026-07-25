@@ -216,6 +216,7 @@ jobs:
           IFS=',' read -r -a PRs <<< "$APPLY_PR_VAL"
           PATCH_FAILED="false"
           FAILED_PRS=""
+          SKIPPED_PRS=""
           for PR_NUM in "${PRs[@]}"; do
             PR_NUM=$(echo "$PR_NUM" | xargs)
             if [ -n "$PR_NUM" ]; then
@@ -230,51 +231,19 @@ jobs:
               elif git apply --check -C0 "pr_${PR_NUM}.diff" 2>/dev/null && git apply -C0 "pr_${PR_NUM}.diff"; then
                 echo "::warning::Applied PR #$PR_NUM with zero context (-C0). Verify the result."
               else
-                echo "::warning::Tiers 1-3 failed for PR #$PR_NUM — trying Tier 4 (direct file fetch)."
+                # Tiers 1-3 (git apply strict/-C1/-C0) all failed. This means the
+                # PR diff no longer matches the current upstream tree — typically a
+                # stale/closed PR authored against an older base. The former Tier 4
+                # blindly overwrote whole files from the PR head SHA, which mixes
+                # incompatible cross-version file copies into the tree and produces
+                # an uncompilable Frankenstein build (e.g. main.rs calling a
+                # commands.rs symbol that the swapped-in file renamed/removed).
+                # Safer: SKIP this PR and build pristine upstream instead.
+                echo "::warning::PR #$PR_NUM does not apply cleanly to this upstream version (git apply strict/-C1/-C0 all failed). Skipping this PR and building pristine upstream. Whole-file overwrite (old Tier 4) is disabled because it mixes incompatible cross-version files."
                 rm -f "pr_${PR_NUM}.diff" 2>/dev/null || true
-                PR_HEAD_SHA=$(curl -sSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                  "https://api.github.com/repos/${UPSTREAM_REPO}/pulls/${PR_NUM}" | jq -r '.head.sha')
-                if [ "$PR_HEAD_SHA" = "null" ] || [ -z "$PR_HEAD_SHA" ]; then
-                  echo "::error::Failed to fetch PR #$PR_NUM metadata."
-                  PATCH_FAILED="true"
-                  FAILED_PRS="${FAILED_PRS} ${PR_NUM}"
-                  continue
-                fi
-                echo "PR #$PR_NUM head SHA: $PR_HEAD_SHA"
-                CHANGED_FILES=$(curl -sSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                  "https://api.github.com/repos/${UPSTREAM_REPO}/pulls/${PR_NUM}/files?per_page=100" | jq -r '.[].filename')
-                if [ -z "$CHANGED_FILES" ]; then
-                  echo "::error::No changed files found for PR #$PR_NUM."
-                  PATCH_FAILED="true"
-                  FAILED_PRS="${FAILED_PRS} ${PR_NUM}"
-                  continue
-                fi
-                APPLIED_COUNT=0
-                while IFS= read -r FILE_PATH; do
-                  [ -z "$FILE_PATH" ] && continue
-                  echo "  Fetching: $FILE_PATH"
-                  HTTP_CODE=$(curl -sSL -w "%{http_code}" -o "pr_${PR_NUM}_file.tmp" \
-                    -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                    "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${PR_HEAD_SHA}/${FILE_PATH}")
-                  if [ "$HTTP_CODE" = "200" ] && [ -s "pr_${PR_NUM}_file.tmp" ]; then
-                    mkdir -p "$(dirname "$FILE_PATH")"
-                    mv "pr_${PR_NUM}_file.tmp" "$FILE_PATH"
-                    git add "$FILE_PATH"
-                    APPLIED_COUNT=$((APPLIED_COUNT + 1))
-                    echo "    OK"
-                  else
-                    rm -f "pr_${PR_NUM}_file.tmp" 2>/dev/null || true
-                    echo "    FAILED (HTTP ${HTTP_CODE})"
-                  fi
-                done <<< "$CHANGED_FILES"
-                if [ "$APPLIED_COUNT" -eq 0 ]; then
-                  echo "::error::Tier 4: Failed to fetch any files for PR #$PR_NUM."
-                  PATCH_FAILED="true"
-                  FAILED_PRS="${FAILED_PRS} ${PR_NUM}"
-                  continue
-                fi
-                echo "::warning::Applied PR #$PR_NUM via Tier 4 (direct file fetch): ${APPLIED_COUNT} files."
-                echo "Verify the result — upstream may have changed these files."
+                git checkout -- . 2>/dev/null || true
+                SKIPPED_PRS="${SKIPPED_PRS} ${PR_NUM}"
+                continue
               fi
               echo "Successfully applied patch for PR #$PR_NUM"
             fi
@@ -283,6 +252,11 @@ jobs:
           # Write outputs for downstream steps
           echo "patch_failed=${PATCH_FAILED}" >> "$GITHUB_OUTPUT"
           echo "failed_prs=${FAILED_PRS}" >> "$GITHUB_OUTPUT"
+          echo "skipped_prs=${SKIPPED_PRS}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$SKIPPED_PRS" ]; then
+            echo "::warning::Skipped (did not apply cleanly, built pristine):${SKIPPED_PRS}"
+          fi
 
           if [ "$PATCH_FAILED" = "true" ]; then
             echo "::warning::Patch application failed for PR(s):${FAILED_PRS}. Will attempt Copilot auto-fix."
