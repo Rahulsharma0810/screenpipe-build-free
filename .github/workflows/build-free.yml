@@ -1116,12 +1116,45 @@ jobs:
           done
           export PATH="$WRAPPER_DIR:$PATH"
 
+          # Marker to detect whether THIS run actually recompiled the binary.
+          BUILD_START_MARKER="$RUNNER_TEMP/build_start_marker"
+          touch "$BUILD_START_MARKER"
+
           echo "::group::tauri build (expect codesign failure)"
+          # NOTE: `|| true` tolerates the EXPECTED codesign failure at the very end
+          # of bundling (we sign separately). It must NOT be allowed to mask a real
+          # cargo COMPILE failure — that is caught by the fail-fast guard below.
           bunx tauri build \
             --target ${{ env.TARGET }} \
             --features ${{ steps.feats.outputs.features }} \
             --bundles app,dmg || true
           echo "::endgroup::"
+
+          # ---- Fail-fast guard: real compile + fresh artifacts ----
+          # A cargo compile error leaves the previously-cached binary/.app in place;
+          # combined with `|| true` the workflow would otherwise report green and
+          # publish a STALE DMG. Assert the binary was (a) produced and (b) rebuilt
+          # by THIS run, and that its embedded CARGO_PKG_VERSION matches the tag.
+          TARGET_ROOT="src-tauri/target/${{ env.TARGET }}/release"
+          BIN="$TARGET_ROOT/screenpipe-app"
+          if [ ! -f "$BIN" ]; then
+            echo "::error::Build guard: compiled binary $BIN not found — cargo compile failed."
+            exit 1
+          fi
+          if [ ! "$BIN" -nt "$BUILD_START_MARKER" ]; then
+            echo "::error::Build guard: $BIN was NOT rebuilt by this run (older than build start). A stale cached binary would be shipped. Failing."
+            exit 1
+          fi
+          EXPECT_VER=$(printf '%s' "${{ needs.check-new-release.outputs.upstream_tag }}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          if [ -n "$EXPECT_VER" ]; then
+            EMBED_VER=$(strings -a "$BIN" 2>/dev/null | grep -oE 'App version: [0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+            echo "Guard: expected embedded version=$EXPECT_VER, found=${EMBED_VER:-<none>}"
+            if [ -n "$EMBED_VER" ] && [ "$EMBED_VER" != "$EXPECT_VER" ]; then
+              echo "::error::Build guard: compiled binary embeds version $EMBED_VER but release tag is $EXPECT_VER. Stale/mismatched build — failing instead of shipping."
+              exit 1
+            fi
+          fi
+          echo "Build guard passed: fresh binary, embedded version OK."
 
       - name: Repair bundle (onnxruntime dylib + embedded version)
         # KNOWN DEFECT: ort's resource copy has been observed to drop a 0-byte
@@ -1140,8 +1173,8 @@ jobs:
           BUNDLE="$TARGET_ROOT/bundle"
           APP=$(find "$BUNDLE/macos" -maxdepth 1 -type d -name "*.app" | head -1)
           if [ -z "$APP" ]; then
-            echo "::warning::No .app bundle found; skipping onnxruntime repair."
-            exit 0
+            echo "::error::No .app bundle found — build did not produce a bundle (compile likely failed). Failing to avoid shipping a stale DMG."
+            exit 1
           fi
           DEST="$APP/Contents/MacOS/libonnxruntime.dylib"
 
