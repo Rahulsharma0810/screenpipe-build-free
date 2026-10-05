@@ -748,16 +748,18 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          # shared-key is stable across Cargo.lock changes (PRs vs tags).
-          # The action auto-includes the Cargo.lock hash in the interior
-          # key, so different lockfiles still get unique full keys.
+          # src-tauri is its own cargo workspace (excluded from the root one), so
+          # list it explicitly; the root workspace target/ is only used by the
+          # optional engine build. rust-cache prunes workspace-member artefacts
+          # (incl. screenpipe-app) and keeps deps, so the stale-version guard and
+          # `cargo clean -p screenpipe-app` below are unaffected.
           shared-key: build-free
-          key: ${{ env.TARGET }}
-          cache-directories: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            apps/screenpipe-app-tauri/src-tauri/target
+          key: ${{ env.TARGET }}-engine-${{ env.BUILD_ENGINE }}
+          workspaces: |
+            apps/screenpipe-app-tauri/src-tauri -> target
+            ${{ env.BUILD_ENGINE == 'true' && '. -> target' || '' }}
+          # Save even when the build fails so the next attempt starts warm.
+          cache-on-failure: true
 
       - name: Cache Tauri sidecars / binary deps
         uses: actions/cache@v5
@@ -788,8 +790,12 @@ jobs:
           eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null || true)"
           echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
           echo "/opt/homebrew/sbin" >> "$GITHUB_PATH"
-          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
-          brew install ffmpeg wget pkg-config cmake
+          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1 HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
+          missing=()
+          for f in ffmpeg wget pkg-config cmake; do
+            command -v "$f" >/dev/null 2>&1 || brew list --formula "$f" >/dev/null 2>&1 || missing+=("$f")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then brew install "${missing[@]}"; else echo "All brew deps already present"; fi
 
       - name: Install frontend dependencies
         working-directory: apps/screenpipe-app-tauri
