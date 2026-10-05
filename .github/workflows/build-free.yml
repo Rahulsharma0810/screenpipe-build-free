@@ -134,7 +134,8 @@ jobs:
 
           # For scheduled runs, always apply these PRs (update list as needed)
           if [ -z "$APPLY_PR" ] && [ "$IS_SCHEDULED" = "true" ]; then
-            APPLY_PR="4333,4344"
+            # 4333 (obsolete) and 4344 (code moved) were dropped; add PRs here as needed.
+            APPLY_PR=""
             echo "Scheduled run: applying default PRs: $APPLY_PR"
           fi
           echo "apply_pr=$APPLY_PR" >> "$GITHUB_OUTPUT"
@@ -777,7 +778,23 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: apps/screenpipe-app-tauri
-        run: bun install
+        run: |
+          bun install
+          # Align @tauri-apps/plugin-* npm versions with the tauri-plugin-* crates in
+          # Cargo.lock; the tauri CLI hard-fails on a major/minor mismatch.
+          LOCK=src-tauri/Cargo.lock
+          [ -f "$LOCK" ] || LOCK=../../Cargo.lock
+          for pkg in $(jq -r '((.dependencies // {}) + (.devDependencies // {})) | keys[] | select(startswith("@tauri-apps/plugin-"))' package.json); do
+            crate="tauri-plugin-${pkg#@tauri-apps/plugin-}"
+            ver=$(awk -v n="$crate" '$0=="name = \""n"\"" {getline; gsub(/version = |"/,""); print; exit}' "$LOCK")
+            [ -n "$ver" ] || continue
+            mm="${ver%.*}"
+            have=$(jq -r --arg p "$pkg" '.version' "node_modules/$pkg/package.json" 2>/dev/null || echo "")
+            if [ "${have%.*}" != "$mm" ]; then
+              echo "Aligning $pkg ($have) to crate $crate $ver"
+              bun add "$pkg@~$mm.0"
+            fi
+          done
 
       - name: Patch next.config to skip type-checking
         # v2.3.27 has a TypeScript error in gmail-card.tsx
@@ -1137,7 +1154,7 @@ jobs:
           bunx tauri build \
             --target ${{ env.TARGET }} \
             --features ${{ steps.feats.outputs.features }} \
-            --bundles app,dmg || true
+            --bundles app,dmg 2>&1 | tee "$RUNNER_TEMP/tauri.log" || true
           echo "::endgroup::"
 
           # ---- Fail-fast guard: real compile + fresh artifacts ----
@@ -1148,7 +1165,8 @@ jobs:
           TARGET_ROOT="src-tauri/target/${{ env.TARGET }}/release"
           BIN="$TARGET_ROOT/screenpipe-app"
           if [ ! -f "$BIN" ]; then
-            echo "::error::Build guard: compiled binary $BIN not found — cargo compile failed."
+            echo "::error::Build guard: compiled binary $BIN not found — tauri build failed. Last output:"
+            tail -n 40 "$RUNNER_TEMP/tauri.log" || true
             exit 1
           fi
           if [ ! "$BIN" -nt "$BUILD_START_MARKER" ]; then
