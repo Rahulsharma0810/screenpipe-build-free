@@ -887,7 +887,9 @@ jobs:
           SIGNED=0
           while IFS= read -r -d '' dylib; do
             codesign --force --sign - "$dylib" 2>/dev/null && SIGNED=$((SIGNED+1))
-          done < <(find apps/screenpipe-app-tauri/src-tauri -name "*.dylib" -print0 2>/dev/null)
+          # Skip target/: re-signing cargo's proc-macro dylibs bumps their mtime
+          # and makes cargo treat every cached dependent crate as stale.
+          done < <(find apps/screenpipe-app-tauri/src-tauri -path apps/screenpipe-app-tauri/src-tauri/target -prune -o -name "*.dylib" -print0 2>/dev/null)
           echo "Ad-hoc signed $SIGNED dylib(s)"
 
       - name: Use production tauri config (productName=screenpipe, identifier=screenpi.pe)
@@ -1238,7 +1240,7 @@ jobs:
           # NOTE: `|| true` tolerates the EXPECTED codesign failure at the very end
           # of bundling (we sign separately). It must NOT be allowed to mask a real
           # cargo COMPILE failure — that is caught by the fail-fast guard below.
-          CARGO_LOG=cargo::core::compiler::fingerprint=info bunx tauri build \
+          bunx tauri build \
             --target ${{ env.TARGET }} \
             --features ${{ steps.feats.outputs.features }} \
             --bundles app,dmg 2>&1 | tee "$RUNNER_TEMP/tauri.log" || true
