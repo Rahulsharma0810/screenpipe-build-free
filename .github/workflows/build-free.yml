@@ -41,6 +41,18 @@ on:
         description: "Upstream repo (owner/name)"
         required: false
         default: "screenpipe/screenpipe"
+      patch_unlimited_history:
+        description: "Personal patch: remove free-plan 24h history cap"
+        type: boolean
+        default: true
+      patch_keep_warm:
+        description: "Personal patch: unfocused monitors stay Warm (never Cold)"
+        type: boolean
+        default: true
+      build_engine:
+        description: "Also build standalone engine CLI (crates/screenpipe-engine `screenpipe` binary)"
+        type: boolean
+        default: false
   repository_dispatch:
     types: [upstream-release]
 
@@ -53,6 +65,11 @@ concurrency:
 env:
   GIT_LFS_SKIP_SMUDGE: "1"
   CARGO_NET_RETRY: "3"
+  # Personal patches (scripts/personal-patches.sh). Default ON for schedule /
+  # repository_dispatch (no inputs); only an explicit `false` disables them.
+  PATCH_UNLIMITED_HISTORY: ${{ github.event.inputs.patch_unlimited_history != 'false' && github.event.client_payload.patch_unlimited_history != false && 'true' || 'false' }}
+  PATCH_KEEP_WARM: ${{ github.event.inputs.patch_keep_warm != 'false' && github.event.client_payload.patch_keep_warm != false && 'true' || 'false' }}
+  BUILD_ENGINE: ${{ (github.event.inputs.build_engine == 'true' || github.event.client_payload.build_engine == true) && 'true' || 'false' }}
 
 jobs:
   check-new-release:
@@ -678,6 +695,23 @@ jobs:
           '
           echo "Pro/cloud gate patch complete."
 
+      - name: Checkout build-free scripts
+        uses: actions/checkout@v6
+        with:
+          path: .build-free
+          fetch-depth: 1
+
+      - name: Apply personal patches (history cap, keep-warm)
+        # Fails the build if a target pattern is missing (upstream drift).
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Upstream commit: $(git rev-parse HEAD)"
+          echo "PATCH_UNLIMITED_HISTORY=$PATCH_UNLIMITED_HISTORY PATCH_KEEP_WARM=$PATCH_KEEP_WARM BUILD_ENGINE=$BUILD_ENGINE"
+          bash .build-free/scripts/personal-patches.sh
+          rm -rf .build-free
+          git diff --stat
+
 
 
       - name: Set up Rust
@@ -915,6 +949,8 @@ jobs:
           echo "- **Base Ref**: \`$BASE_REF\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Target Version**: \`${{ steps.feats.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Latest Release Tag**: \`$UPSTREAM_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream Commit**: \`$(git rev-parse HEAD)\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Personal patches**: unlimited-history=\`$PATCH_UNLIMITED_HISTORY\`, keep-warm=\`$PATCH_KEEP_WARM\`, engine-cli=\`$BUILD_ENGINE\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # 1. Process Applied PRs via apply_pr
@@ -1360,6 +1396,32 @@ jobs:
         with:
           name: screenpipe-macos-arm64-${{ steps.feats.outputs.version }}
           path: ${{ runner.temp }}/stage/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build standalone engine CLI (screenpipe binary)
+        if: env.BUILD_ENGINE == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$GITHUB_WORKSPACE/.compiler-wrapper:$PATH"
+          FEATS="metal"
+          grep -qE '^parakeet-mlx\s*=' crates/screenpipe-engine/Cargo.toml && FEATS="${FEATS},parakeet-mlx"
+          grep -qE '^redact-onnx-coreml\s*=' crates/screenpipe-engine/Cargo.toml && FEATS="${FEATS},redact-onnx-coreml"
+          cargo build --release --target "${{ env.TARGET }}" -p screenpipe-engine --bin screenpipe --features "$FEATS"
+          BIN="target/${{ env.TARGET }}/release/screenpipe"
+          codesign --force --timestamp=none --sign - "$BIN"
+          mkdir -p "$RUNNER_TEMP/engine"
+          cp "$BIN" "$RUNNER_TEMP/engine/screenpipe"
+          tar -C "$RUNNER_TEMP/engine" -czf "$RUNNER_TEMP/stage/screenpipe-engine-macos-arm64.tar.gz" screenpipe
+          ls -lh "$RUNNER_TEMP/stage"
+
+      - name: Upload engine artifact
+        if: env.BUILD_ENGINE == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: screenpipe-engine-macos-arm64-${{ steps.feats.outputs.version }}
+          path: ${{ runner.temp }}/stage/screenpipe-engine-macos-arm64.tar.gz
           if-no-files-found: error
           retention-days: 14
 
