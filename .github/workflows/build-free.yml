@@ -754,9 +754,20 @@ jobs:
 
 
 
+      - name: Resolve Rust toolchain (rust-toolchain.toml)
+        id: rusttc
+        shell: bash
+        run: |
+          # Upstream pins the toolchain in rust-toolchain.toml; installing a
+          # floating `stable` too only churns the rust-cache key.
+          TC=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml 2>/dev/null | head -1)
+          echo "toolchain=${TC:-stable}" >> "$GITHUB_OUTPUT"
+          echo "toolchain=${TC:-stable}"
+
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rusttc.outputs.toolchain }}
           targets: aarch64-apple-darwin
 
       - name: Set up Bun
@@ -777,6 +788,7 @@ jobs:
           # optional engine build. rust-cache prunes workspace-member artefacts
           # (incl. screenpipe-app) and keeps deps, so the stale-version guard and
           # `cargo clean -p screenpipe-app` below are unaffected.
+          prefix-key: v2-rust
           shared-key: build-free
           key: ${{ env.TARGET }}-engine-${{ env.BUILD_ENGINE }}
           workspaces: |
@@ -1226,7 +1238,7 @@ jobs:
           # NOTE: `|| true` tolerates the EXPECTED codesign failure at the very end
           # of bundling (we sign separately). It must NOT be allowed to mask a real
           # cargo COMPILE failure — that is caught by the fail-fast guard below.
-          bunx tauri build \
+          CARGO_LOG=cargo::core::compiler::fingerprint=info bunx tauri build \
             --target ${{ env.TARGET }} \
             --features ${{ steps.feats.outputs.features }} \
             --bundles app,dmg 2>&1 | tee "$RUNNER_TEMP/tauri.log" || true
