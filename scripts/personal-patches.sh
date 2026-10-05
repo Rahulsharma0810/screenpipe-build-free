@@ -132,6 +132,19 @@ if [ "$PATCH_UNLIMITED_PIPES" = "true" ]; then
             LocalPlanPolicy::VerifiedFree
             | LocalPlanPolicy::Unknown
             | LocalPlanPolicy::VerifiedPaid => {}' "unlimited-pipes"
+  # Runtime plan refresh re-applies Some(2) to the live pipe manager.
+  replace_exact "apps/screenpipe-app-tauri/src-tauri/src/commands.rs" \
+'pipe_manager.set_max_non_template_pipes(restrict_paid_features.then_some(2))' \
+'pipe_manager.set_max_non_template_pipes(None)' "unlimited-pipes-runtime"
+  # Core backstop: ignore any limit passed in from any caller.
+  replace_exact "crates/screenpipe-core/src/pipes/mod.rs" \
+'    pub fn set_max_non_template_pipes(&mut self, limit: Option<usize>) -> bool {
+        if self.max_non_template_pipes == limit {' \
+'    pub fn set_max_non_template_pipes(&mut self, limit: Option<usize>) -> bool {
+        // personal build: no local pipe cap
+        let _ = limit;
+        let limit: Option<usize> = None;
+        if self.max_non_template_pipes == limit {' "unlimited-pipes-core"
 else
   echo "[unlimited-pipes] skipped (PATCH_UNLIMITED_PIPES=$PATCH_UNLIMITED_PIPES)"
 fi
