@@ -21,6 +21,11 @@
 #   PATCH_KEEP_WARM=true|false          (default true)
 #     Unfocused monitors never drop to Cold; they stay Warm (periodic probe,
 #     frame + OCR on visual change) instead of stopping capture.
+#   PATCH_SELF_UPDATER=true|false       (default true)
+#     Native in-app updater checks SELF_UPDATER_ENDPOINT (this repo's latest
+#     GitHub Release latest.json) instead of screenpipe.com, sends no cloud
+#     token there, and is no longer disabled as a "source build". The
+#     workflow sets plugins.updater endpoints/pubkey in tauri.conf.json.
 #
 # Last verified against screenpipe/screenpipe main @ 6e9f48b (2026-10-05).
 set -euo pipefail
@@ -30,6 +35,8 @@ PATCH_KEEP_WARM="${PATCH_KEEP_WARM:-true}"
 PATCH_LOCAL_ACCESS="${PATCH_LOCAL_ACCESS:-true}"
 PATCH_UNLIMITED_PIPES="${PATCH_UNLIMITED_PIPES:-true}"
 PATCH_NO_TRIAL_PAYWALL="${PATCH_NO_TRIAL_PAYWALL:-true}"
+PATCH_SELF_UPDATER="${PATCH_SELF_UPDATER:-true}"
+SELF_UPDATER_ENDPOINT="${SELF_UPDATER_ENDPOINT:-https://github.com/Rahulsharma0810/screenpipe-build-free/releases/latest/download/latest.json}"
 
 # replace_exact FILE FROM TO LABEL — literal (non-regex) single-occurrence replace.
 replace_exact() {
@@ -158,4 +165,25 @@ if [ "$PATCH_NO_TRIAL_PAYWALL" = "true" ]; then
 '  return false && (state === "summary" || state === "paywall");' "no-trial-paywall"
 else
   echo "[no-trial-paywall] skipped (PATCH_NO_TRIAL_PAYWALL=$PATCH_NO_TRIAL_PAYWALL)"
+fi
+
+if [ "$PATCH_SELF_UPDATER" = "true" ]; then
+  UPD="apps/screenpipe-app-tauri/src-tauri/src/updates.rs"
+  # Consumer endpoint (stable / pre-release channel) -> this repo's latest release.
+  replace_exact "$UPD" \
+'        "https://screenpipe.com/api/app-update/{channel}/{{{{target}}}}-{{{{arch}}}}/{{{{current_version}}}}"
+    )' \
+'        "{}",
+        { let _ = channel; "'"$SELF_UPDATER_ENDPOINT"'" }
+    )' "self-updater"
+  # Don't send the screenpipe cloud token to GitHub (consumer builds only).
+  replace_exact "$UPD" \
+'    } else if let Some(settings) = settings {' \
+'    } else if let Some(settings) = settings.filter(|_| false) {' "self-updater"
+  # Updates are disabled for "source builds" (no official-build feature).
+  replace_exact "$UPD" \
+'    !cfg!(feature = "official-build") && !cfg!(feature = "enterprise-build")' \
+'    false' "self-updater"
+else
+  echo "[self-updater] skipped (PATCH_SELF_UPDATER=$PATCH_SELF_UPDATER)"
 fi

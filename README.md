@@ -149,7 +149,9 @@ rm ~/Library/LaunchAgents/com.rvs.screenpipe-autopipe.plist
 
 ## Build notes
 
-- CI signs ad-hoc (`-`); local install re-signs with `Screenpipe Local Dev` identity
+- CI signs with the stable self-signed identity `screenpipe-build-free` (secret `MACOS_CODESIGN_P12_BASE64`, temp keychain, deleted after the run). The designated requirement pins the certificate leaf hash, so TCC grants survive updates.
+- Self-updater (`PATCH_SELF_UPDATER`, default on): the native Screenpipe updater checks `https://github.com/Rahulsharma0810/screenpipe-build-free/releases/latest/download/latest.json`. Each release carries `screenpipe-macos-arm64.app.tar.gz` (the final re-signed .app), its minisign `.sig` (`TAURI_SIGNING_PRIVATE_KEY`) and `latest.json`; the release is marked Latest.
+- App version is `X.Y.(Z*1000 + run_number%1000)` from upstream `app-vX.Y.Z` (e.g. 2.7.84 built in run 353 -> `2.7.84353`). Tauri compares plain semver (`>`), and a prerelease suffix would sort *below* the release, so a numeric patch is used: rebuilds of the same tag are newer, and the next upstream patch always beats any rebuild. Only wraps after 1000 runs on a single upstream patch.
 - Signing is inside-out: dylibs/.so/.metallib first, then executables, then outer bundle
 - Post-sign quarantine cleared via `xattr -dr com.apple.quarantine` (never `xattr -cr` — preserves cs.* xattrs for metallib)
 - TCC usage keys (Mic, Screen, Camera, Accessibility, AppleEvents) injected by install script
