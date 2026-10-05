@@ -49,6 +49,18 @@ on:
         description: "Personal patch: unfocused monitors stay Warm (never Cold)"
         type: boolean
         default: true
+      patch_local_access:
+        description: "Personal patch: local server/recording start without sign-in/paid plan"
+        type: boolean
+        default: true
+      patch_unlimited_pipes:
+        description: "Personal patch: remove free-plan 2-pipe cap"
+        type: boolean
+        default: true
+      patch_no_trial_paywall:
+        description: "Personal patch: disable fresh-install trial-activation paywall"
+        type: boolean
+        default: true
       build_engine:
         description: "Also build standalone engine CLI (crates/screenpipe-engine `screenpipe` binary)"
         type: boolean
@@ -69,6 +81,9 @@ env:
   # repository_dispatch (no inputs); only an explicit `false` disables them.
   PATCH_UNLIMITED_HISTORY: ${{ github.event.inputs.patch_unlimited_history != 'false' && github.event.client_payload.patch_unlimited_history != false && 'true' || 'false' }}
   PATCH_KEEP_WARM: ${{ github.event.inputs.patch_keep_warm != 'false' && github.event.client_payload.patch_keep_warm != false && 'true' || 'false' }}
+  PATCH_LOCAL_ACCESS: ${{ github.event.inputs.patch_local_access != 'false' && github.event.client_payload.patch_local_access != false && 'true' || 'false' }}
+  PATCH_UNLIMITED_PIPES: ${{ github.event.inputs.patch_unlimited_pipes != 'false' && github.event.client_payload.patch_unlimited_pipes != false && 'true' || 'false' }}
+  PATCH_NO_TRIAL_PAYWALL: ${{ github.event.inputs.patch_no_trial_paywall != 'false' && github.event.client_payload.patch_no_trial_paywall != false && 'true' || 'false' }}
   BUILD_ENGINE: ${{ (github.event.inputs.build_engine == 'true' || github.event.client_payload.build_engine == true) && 'true' || 'false' }}
 
 jobs:
@@ -708,7 +723,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Upstream commit: $(git rev-parse HEAD)"
-          echo "PATCH_UNLIMITED_HISTORY=$PATCH_UNLIMITED_HISTORY PATCH_KEEP_WARM=$PATCH_KEEP_WARM BUILD_ENGINE=$BUILD_ENGINE"
+          echo "PATCH_UNLIMITED_HISTORY=$PATCH_UNLIMITED_HISTORY PATCH_KEEP_WARM=$PATCH_KEEP_WARM PATCH_LOCAL_ACCESS=$PATCH_LOCAL_ACCESS PATCH_UNLIMITED_PIPES=$PATCH_UNLIMITED_PIPES PATCH_NO_TRIAL_PAYWALL=$PATCH_NO_TRIAL_PAYWALL BUILD_ENGINE=$BUILD_ENGINE"
           bash .build-free/scripts/personal-patches.sh
           rm -rf .build-free
           git diff --stat
@@ -967,7 +982,7 @@ jobs:
           echo "- **Target Version**: \`${{ steps.feats.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Latest Release Tag**: \`$UPSTREAM_TAG\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Upstream Commit**: \`$(git rev-parse HEAD)\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Personal patches**: unlimited-history=\`$PATCH_UNLIMITED_HISTORY\`, keep-warm=\`$PATCH_KEEP_WARM\`, engine-cli=\`$BUILD_ENGINE\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Personal patches**: unlimited-history=\`$PATCH_UNLIMITED_HISTORY\`, keep-warm=\`$PATCH_KEEP_WARM\`, local-access=\`$PATCH_LOCAL_ACCESS\`, unlimited-pipes=\`$PATCH_UNLIMITED_PIPES\`, no-trial-paywall=\`$PATCH_NO_TRIAL_PAYWALL\`, engine-cli=\`$BUILD_ENGINE\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # 1. Process Applied PRs via apply_pr
