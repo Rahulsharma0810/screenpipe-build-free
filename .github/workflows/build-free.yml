@@ -1420,6 +1420,20 @@ jobs:
           # (skipping 0-byte placeholders and non-Mach-O data files), then sign
           # the outer bundle last.
           echo "::group::Inside-out signing nested Mach-O objects"
+          # Metal libraries under Contents/MacOS are nested code whose signature
+          # lives in xattrs (com.apple.cs.*). The updater tarball and Tauri's
+          # extractor drop xattrs, leaving "mlx.metallib not signed at all".
+          # Move them to Contents/Resources (sealed by content hash, no xattrs)
+          # and leave a relative symlink so the binary still finds them.
+          while IFS= read -r -d '' m; do
+            n=$(basename "$m")
+            [ -e "$APP/Contents/Resources/$n" ] && { echo "::error::Resources/$n already exists"; exit 1; }
+            mkdir -p "$APP/Contents/Resources"
+            mv "$m" "$APP/Contents/Resources/$n"
+            ln -s "../Resources/$n" "$m"
+            echo "Moved $n -> Contents/Resources (symlinked from MacOS/)"
+          done < <(find "$APP/Contents/MacOS" -maxdepth 1 -type f -name '*.metallib' -print0)
+          xattr -cr "$APP/Contents/Resources" 2>/dev/null || true
           # sign_one: sign a single file if it is a non-empty Mach-O object.
            sign_one() {
              f="$1"
@@ -1442,7 +1456,8 @@ jobs:
            # Pass 1: sign libraries FIRST (*.dylib, *.so, *.metallib). Executables
            # that link/reference these require them to already carry a signature,
            # otherwise codesign fails with "code object is not signed at all".
-           find "$APP/Contents" -type f \( -name '*.dylib' -o -name '*.so' -o -name '*.metallib' \) -print0 \
+           find "$APP/Contents" -type f \( -name '*.dylib' -o -name '*.so' -o -name '*.metallib' \) \
+             ! -path "$APP/Contents/Resources/*.metallib" -print0 \
            | while IFS= read -r -d '' f; do sign_one "$f"; done
            # Pass 2: sign remaining executables (Mach-O without lib suffix).
            find "$APP/Contents" -type f -perm -u+x \
@@ -1546,7 +1561,7 @@ jobs:
           CHK=$(mktemp -d)
           tar -xzf "$STAGE/$ASSET" -C "$CHK"
           codesign -d -r - "$CHK"/*.app 2>&1 | tail -1
-          codesign --verify --deep --strict "$CHK"/*.app || echo "::warning::extracted updater .app fails strict verification"
+          codesign --verify --deep --strict "$CHK"/*.app || { echo "::error::extracted updater .app fails strict verification"; exit 1; }
           rm -rf "$CHK"
           ls -lh "$STAGE"
 
